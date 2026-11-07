@@ -1,0 +1,22 @@
+{
+  "name": "reins",
+  "version": "0.1.0",
+  "description": "A command guard for coding agents: refuses or escalates shell commands that only a human should run.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "FSL-1.1-MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bretperry/reins"
+  },
+  "exports": "./src/guard.mjs",
+  "files": [
+    "src/",
+    "sets/"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

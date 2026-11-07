@@ -1,0 +1,18 @@
+{
+  "$comment": "Metered CI. A full `gh run rerun` re-bills green jobs: only `--failed` or `--job` reruns pass, after reading the failure. A manual workflow run bills the full suite, so it asks. The REST roads to both are the guard's code (evaluateGhApi).",
+  "deny": [
+    {
+      "on": "program",
+      "match": "^gh\\s+run\\s+rerun\\b",
+      "unless": "\\s--(failed|job)\\b",
+      "reason": "Rerun only the failed jobs: `gh run rerun <id> --failed`, after reading the failure."
+    }
+  ],
+  "ask": [
+    {
+      "on": "program",
+      "match": "^gh\\s+workflow\\s+run\\b",
+      "reason": "A manual workflow run bills the full suite; say what it is for."
+    }
+  ]
+}

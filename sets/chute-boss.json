@@ -1,0 +1,22 @@
+{
+  "$comment": "Asks before a command that loosens the lock's load line, because the lock cannot tell a real waiver from an agent granting itself one. A waiver is the user's call; the lock records it and its reason in waivers.log.",
+  "ask": [
+    {
+      "match": "\\b(lock|lock\\.mjs|perf:queue|perf-queue\\.mjs)\\b.*\\bwaive\\b",
+      "reason": "a lock waiver lets one holder past the load line: only the user grants one"
+    },
+    {
+      "match": "--ignore-load\\b",
+      "reason": "--ignore-load skips the lock's load line: only the user grants that"
+    },
+    {
+      "match": "^",
+      "unless": "(?![\\s\\S]*\\b(?:WHIPPLETREE|CHUTE_BOSS)_(PERF_)?LOAD_MAX\\s*=)",
+      "reason": "setting WHIPPLETREE_*LOAD_MAX or CHUTE_BOSS_*LOAD_MAX on a command moves the lock's load line: only the user sets a machine's line"
+    },
+    {
+      "match": "(?:^|[\\s/'\"])chute-boss(?:\\.mjs|/bin\\.mjs)?(?:@[A-Za-z0-9._:+/-]+)?(?=$|[\\s'\"])",
+      "reason": "direct chute-boss calls must use the project lock shim so its aliases and judge apply"
+    }
+  ]
+}
