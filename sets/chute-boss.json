@@ -11,8 +11,8 @@
     },
     {
       "match": "^",
-      "unless": "(?![\\s\\S]*\\b(?:WHIPPLETREE|CHUTE_BOSS)_(PERF_)?LOAD_MAX\\s*=)",
-      "reason": "setting WHIPPLETREE_*LOAD_MAX or CHUTE_BOSS_*LOAD_MAX on a command moves the lock's load line: only the user sets a machine's line"
+      "unless": "(?![\\s\\S]*\\bCHUTE_BOSS_(PERF_)?LOAD_MAX\\s*=)",
+      "reason": "setting CHUTE_BOSS_LOAD_MAX or CHUTE_BOSS_PERF_LOAD_MAX on a command moves the lock's load line: only the user sets a machine's line"
     },
     {
       "match": "(?:^|[\\s/'\"])chute-boss(?:\\.mjs|/bin\\.mjs)?(?:@[A-Za-z0-9._:+/-]+)?(?=$|[\\s'\"])",

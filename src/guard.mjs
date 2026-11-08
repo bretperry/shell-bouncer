@@ -1,26 +1,25 @@
-#!/usr/bin/env node
-// Refuses or escalates agent shell commands that only a human should run.
-// In the app: nothing at runtime; a coding agent's pre-command hook (Claude Code PreToolUse on Bash, Cursor beforeShellExecution) runs it before every agent command.
-// Used by: the hook entry that runs this file with `claude` or `cursor`; tested by test/core.test.mjs.
-// Uses: git (the branch where each commit or push runs); .env, package.json, Prisma config, and SQL files a database command reads; its rule sets, sets/*.json (each must load); command-guard.project.json, scripts/command-guard.d/*.json, and harness.project.json's protectedBranches when present.
-// Run: `node src/guard.mjs claude` or `node src/guard.mjs cursor`, from the agent's hook; a hook payload on stdin.
+// Refuses or escalates agent shell commands that only a human should run: the guard's core.
+// In the app: nothing at runtime; a coding agent's pre-command hook (Claude Code PreToolUse on Bash, Cursor beforeShellExecution) runs it before every agent command, through bin/reins.mjs.
+// Used by: bin/reins.mjs (`reins hook`, `reins explain`, `reins sets`), and any caller that imports the package; tested by test/*.test.mjs.
+// Uses: git (the branch where each commit or push runs); .env, package.json, Prisma config, and SQL files a database command reads; the rule sets named (sets/*.json, each must load); the project's reins.json, its rule folder, and its branch file when present (`files`).
+// Run: `reins hook claude` or `reins hook cursor`, from the agent's hook; a hook payload on stdin.
 // When: before every agent shell command runs; not for a person's own shell, and not a substitute for the rules it enforces.
-// Env: WHIPPLETREE_GUARD (`off`: no verdict, so the command runs as it would with no guard); a database URL variable a command names, read from this process's environment, then the repo's .env.
-// Writes: nothing (read-only): `git rev-parse --abbrev-ref HEAD` (and `--git-common-dir` for a push) in the command's directory, and the rule and config files named in Uses, plus a freeze marker a set names (SHIP_FREEZE_FILE); the verdict JSON on stdout.
+// Env: REINS or WHIPPLETREE_GUARD (`off`: no verdict, so the command runs as it would with no guard; `offEnv` replaces the names); CLAUDE_PROJECT_DIR or CURSOR_PROJECT_DIR (the project root, when the caller names none); a database URL variable a command names, read from this process's environment, then the repo's .env.
+// Writes: nothing (read-only): `git rev-parse --abbrev-ref HEAD` (and `--git-common-dir` for a push) in the command's directory, and the rule and config files named in Uses, plus a freeze marker a set names; the verdict JSON on stdout.
 // Exit: 0 always; the verdict is JSON on stdout (deny, ask, or none, which Claude reads as no opinion); a crash or the 3 s watchdog answers ask.
 //
 // Written rules say what an agent never does; this makes the worst of them a refusal instead of a
 // memory test. "deny" is for acts no session may take (flipping a ready PR back to draft,
 // force-pushing or deleting a protected branch, deleting data). "ask" is for acts that are fine with the user's OK in the
 // moment (marking a PR ready, merging, shipping main, a manual workflow run): the user sees the prompt and decides.
-// Fails closed to ask (crash, size or time budget, watchdog); details at main(). Off switch: WHIPPLETREE_GUARD=off.
+// Fails closed to ask (crash, size or time budget, watchdog); details at main(). Off switch: REINS=off.
 //
 // The full list, so no agent reads the body to learn it (project and pack rule files add their own).
 // The rules that belong to one team's workflow (its branches and switches, a merge conveyor, a draft
-// flow, CI minutes, a lock) are data in the bundled rule sets in sets/ (GUARD_SETS), read by the
+// flow, CI minutes, a lock) are data in the bundled rule sets in sets/ (BUNDLED_SETS), read by the
 // knobs in loadSets(); this file holds the general rules and the evaluators.
 // - deny, git: `--no-verify`, `-c core.hooksPath=… push`, or a set's variable that skips the pre-push checks on a push;
-//   force-pushing, deleting, or renaming a protected branch (main, or a set's or file's protectedBranches);
+//   force-pushing, deleting, or renaming a protected branch (main and master, or a set's or the config's protectedBranches);
 //   any push to a workflow-only branch (a set's); `[skip ci]` on a commit off the branches a set allows; any push to a branch
 //   while its freeze marker (a set's) is set.
 // - deny, GitHub: a ready PR back to draft; a full `gh run rerun` (only `--failed`/`--job`);
@@ -35,16 +34,17 @@
 //   drop, rollback, or dev migrate against one; `dropdb`; Neon, Turso, PlanetScale, Cloudflare
 //   D1/R2/KV deletes; cloud CLI deletes (aws, gcloud, az, gsutil, …); `terraform|tofu apply|destroy`,
 //   Terraform state rm/push/migrate; `cdk|cdktf deploy|destroy|…`. A data deny can be lifted for an
-//   exact command in command-guard.project.json.
+//   exact command in the project's reins.json (`allow`).
 // - deny, any line: a rule file that is present but doesn't load.
 // - ask: `gh pr ready`, `gh pr merge` (and its GraphQL/API forms);
-//   pushing or moving main; `gh workflow run` or a dispatch; changing branch protection or
+//   pushing or moving main or master (`askOnPush`); `gh workflow run` or a dispatch; changing branch protection or
 //   a ruleset; setting core.hooksPath or a key a set names; a git alias; a forced push from a branch it can't read.
 // - ask, data: destructive SQL, a migration, or a store delete where it can't tell the target; SQL it
 //   can't read or built at run time (DO, EXECUTE, \gexec) against a non-loopback database; destructive
 //   SQL in a container; removing Docker volumes; `terraform test`, `cdk bootstrap|import`.
-// - ask, the guard itself: writing, moving, or deleting a guard file (this script, its rule files,
-//   harness.project.json, the hook config); a line it can't read in time, in size, or in depth.
+// - ask, the guard itself: writing, moving, or deleting a guard file (its config, its rule files, its
+//   installed package, the hook config); changing the guard's own package with a package manager;
+//   a line it can't read in time, in size, or in depth.
 //
 // One shell parser, parseLine(), reads the line as a shell would (quotes and heredoc bodies stay
 // with their command), and each rule reads a command in command position, so `grep -rn "terraform
@@ -59,33 +59,50 @@
 // (FLOOR_*), so the per-client reading can only tighten a verdict.
 //
 // The built-in git and GitHub acts are a table (POLICY) in a project rule's shape. A project's own
-// rules live in command-guard.project.json (deny, ask, and exact-command
-// exemptions from a data-delete deny), a stack pack's in scripts/command-guard.d/<pack>.json (deny
-// and ask), and the branches no agent rewrites in harness.project.json → protectedBranches. A rule
+// rules live in its reins.json (deny, ask, and exact-command exemptions from a data-delete deny),
+// a pack's in the config's rule folder (`ruleDir`, deny and ask), and the branches no agent
+// rewrites in the config's protectedBranches. A caller may rename those files (`files`). A rule
 // file that is present but doesn't load fails closed: every command is refused, naming the file,
 // because a broken file read as "no rules" would quietly allow everything it exists to stop.
-// The rule sets are stricter: they load from this script's own folder
-// (never the hook's cwd), each one named in GUARD_SETS must load, and no exemption lifts their rows.
+// The rule sets are stricter: they load from the package's own folder or a path the caller names
+// (never the hook's cwd), each one named must load, and no exemption lifts their rows.
 
 // Node builtins only, so the hook runs before `pnpm install`.
 import { execFileSync } from "node:child_process";
-import { lstatSync, opendirSync, readdirSync, readFileSync, realpathSync, statSync, writeSync } from "node:fs";
+import { lstatSync, opendirSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 
-// The project's rule file, the packs' rule directory, and the file naming protected branches, relative to the repo root.
-const PROJECT_RULES = "command-guard.project.json";
-const PACK_RULES = "scripts/command-guard.d";
-const HARNESS_PROJECT = "harness.project.json";
+// The files the guard reads from the project root (`files`; a caller may rename any of them):
+// - `config`: the project's config and its own rules (reins.json; CONFIG_KEYS). Absent: the core alone.
+// - `ruleDir`: a folder of pack rule files (*.json, deny and ask, name order). None by default; the
+//   config's `ruleDir` names one too. Absent folder: nothing added.
+// - `branches`: a file whose `protectedBranches` key alone is the guard's (another tool's config file
+//   may carry it). None by default.
+// A key not listed here is an error, so a misspelt one can't drop a file silently.
+// The package's npm name: the one place the code names it (the guard's own package, its install
+// folder). It must equal package.json's "name"; test/package.test.mjs checks that.
+export const PACKAGE_NAME = "reins";
+
+export const DEFAULT_FILES = Object.freeze({ config: "reins.json", ruleDir: null, branches: null });
+
+// The keys reins.json may hold. `sets` names bundled sets; `deny`, `ask`, and `allow` are the
+// project's own rules, as a project rule file holds them; the rest are knobs (loadRules()).
+const CONFIG_KEYS = ["$comment", "sets", "ruleDir", "protectedBranches", "askOnPush", "askTags", "deny", "ask", "allow"];
 
 // The bundled rule sets: a team's own rules as data, one JSON file each in the package's sets/ folder
-// (sets/<name>.json), loaded in this order (loadSets()). Every one must load: a set
-// that is missing or broken refuses every command, unlike a project or pack file, where absent adds
-// nothing. The order decides which reason shows when two rows of a kind fire on one command.
+// (sets/<name>.json). None loads unless the config or the caller names it (`sets`), and then every
+// one named must load: a set that is missing or broken refuses every command, unlike a project or
+// pack file, where absent adds nothing. The order named decides which reason shows when two rows of
+// a kind fire on one command.
 const SET_DIR = "sets";
-const GUARD_SETS = ["draft-flow", "merge-conveyor", "ci-minutes", "chute-boss"];
+export const BUNDLED_SETS = Object.freeze(["draft-flow", "merge-conveyor", "ci-minutes", "chute-boss"]);
+
+// The off switch: any of these set to `off` turns the guard off (`offEnv` replaces the list). The
+// second is the name the guard had before it was a package, still read.
+export const DEFAULT_OFF_ENV = Object.freeze(["REINS", "WHIPPLETREE_GUARD"]);
 
 // Unix-socket directories that are this machine's Postgres or MySQL. Any other path is not: `/cloudsql/…`
 // is the Cloud SQL proxy's socket for a production database.
@@ -269,17 +286,23 @@ const ALWAYS_DESTRUCTIVE = [
   /^gh\s+(repo|release)\s+delete(-asset)?\b/,
 ];
 
-// Branches no agent rewrites or deletes (`protected`); pushing `main` also ships production. This is
-// the core's default; a rule set's `protectedBranches` replaces it (a set may name main, dev, and a
-// generated branch), and harness.project.json → `protectedBranches` replaces that in turn (loadRules()).
+// Branches no agent rewrites or deletes (`protected`). This is the core's default; a rule set's
+// `protectedBranches` replaces it (a set may name main, dev, and a generated branch), and the
+// config's (or the `branches` file's) `protectedBranches` replaces that in turn (loadRules()).
 // `workflowOnly` are the ones only a workflow writes, so an agent never pushes them at all: a set's
 // `workflowOnlyBranches` (a generated branch that one publish workflow alone writes). A branch keeps
 // that rule whenever it is protected; a project without one loses nothing.
-const CORE_PROTECTED = ["main"];
+const CORE_PROTECTED = ["main", "master"];
+
+// Branches whose every push (or ref move) asks, since pushing one usually ships production: the
+// config's `askOnPush` replaces the default.
+const CORE_ASK_ON_PUSH = ["main", "master"];
+const CORE_ASK_ON_PUSH_SET = new Set(CORE_ASK_ON_PUSH);
+const askOnPushOf = (branches) => branches.askOnPush ?? CORE_ASK_ON_PUSH_SET;
 
 // The freeze markers (a set's `freezeMarkers`; a ship freeze stops pushes to a branch while a release is open) sit in the clone's shared git dir (`git rev-parse
 // --git-common-dir`) so every worktree of the clone sees them; while one is there, a push to its branch
-// is refused (shipFreeze()). SHIP_FREEZE_FILE, exported at the end of this file, is the first one's name.
+// is refused (shipFreeze()).
 
 // Words that run the command after them, so the command word is the next one (`builtin cd x` is a cd).
 const PREFIXES = new Set(["sudo", "env", "time", "nice", "command", "builtin", "exec", "npx", "bunx"]);
@@ -394,8 +417,8 @@ const currentBranch = (dir) => {
 
 // The freeze marker's text in `dir`'s clone (trimmed; "" when empty), or null when there is none
 // or git can't say where the clone's git dir is. `file` is the marker's name (a set's `freezeMarkers`).
-export const shipFreeze = (dir, file = SHIP_FREEZE_FILE) => {
-  if (file === "") return null;
+export const shipFreeze = (dir, file) => {
+  if (typeof file !== "string" || file === "") return null;
   try {
     const common = execFileSync("git", ["-C", dir, "rev-parse", "--git-common-dir"], {
       encoding: "utf8",
@@ -1169,7 +1192,7 @@ export const evaluate = (command, { limits = LIMITS, ...options } = {}) => {
   try {
     // One lookup per directory however many commands run there (`cd .;` then 5000 commands), and
     // one SQL-read budget for the whole line, every nested line included (MAX_SQL_FILES, MAX_SQL_FILE_BYTES).
-    return evaluateLine(command, { ...options, branch, branchIn, rules, sets, lookups: new Map(), sqlBudget: { files: 0, bytes: 0 } });
+    return evaluateLine(command, { ...options, branch, branchIn, rules, sets, guard: rules.guard ?? defaultGuard(), lookups: new Map(), sqlBudget: { files: 0, bytes: 0 } });
   } catch (error) {
     // Defensive, likely unreachable: vm's timeout terminates the script and does not run this
     // catch, but if a runtime ever surfaces it here, main() still answers it, naming the watchdog.
@@ -1177,7 +1200,7 @@ export const evaluate = (command, { limits = LIMITS, ...options } = {}) => {
     if (error instanceof OverBudget && error.kind === "wall") return ask(`Reading this command line took more than ${wallMs} ms of wall-clock time (the guard's backstop for a read that blocks), so it stopped; the user confirms it.`);
     if (error instanceof OverBudget) return ask(`Reading this command line used more than the guard's ${limits.ms} ms budget of CPU time, so it stopped; the user confirms it.`);
     if (error instanceof TooDeep) return ask(`This command line nests \`$(\`, \`\${\`, or quotes more than ${MAX_SCAN_NESTING} levels deep, deeper than the guard reads; the user confirms it.`);
-    return ask(`command-guard failed reading this line (${error instanceof Error ? error.message : String(error)}), so the user confirms it. Tell the user: a guard bug must not let a command through unseen.`);
+    return ask(`The guard failed reading this line (${error instanceof Error ? error.message : String(error)}), so the user confirms it. Tell the user: a guard bug must not let a command through unseen.`);
   } finally {
     if (outer) budget = null;
   }
@@ -1197,7 +1220,7 @@ export const evaluate = (command, { limits = LIMITS, ...options } = {}) => {
 // is most likely the dev one, but the guard can't read it); `written` (files an earlier command on
 // the line writes); `sqlBudget` (the line's SQL reads so far). `sets` is the loaded rule sets (evaluate()).
 const evaluateLine = (command, options) => {
-  const { branch, rules, sets, depth = 0, infra = true, targetIn = () => null, scriptIn = () => "", fileIn = () => null, dirIn = () => null, dirExists = () => true, startDir = null, env = new Map(), nesting = 0, lost: lostIn = false, wrapped = false, remote = false, container = false, written: writtenIn = new Set(), sqlBudget = { files: 0, bytes: 0 } } = options;
+  const { branch, rules, sets, guard = defaultGuard(), depth = 0, infra = true, targetIn = () => null, scriptIn = () => "", fileIn = () => null, dirIn = () => null, dirExists = () => true, startDir = null, env = new Map(), nesting = 0, lost: lostIn = false, wrapped = false, remote = false, container = false, written: writtenIn = new Set(), sqlBudget = { files: 0, bytes: 0 } } = options;
   // Nested past MAX_NESTING: one prompt costs less than reading on past the hook's timeout.
   if (nesting > MAX_NESTING) return ask(`This line nests \`eval\`, \`sh -c\`, or scripts more than ${MAX_NESTING} deep, so the guard stopped reading it: confirm what it runs.`);
   const branches = rules.branches ?? sets.branches;
@@ -1497,7 +1520,7 @@ const evaluateLine = (command, options) => {
     // The command's words after the shell's quote and escape removal (redirect targets included), ASCII-lowered.
     const heredocText = parsed.heredocs.map((doc) => `${doc.body}\n${doc.delim}`);
     const decoded = foldAscii([list.join(" "), ...heredocText].join("\n"));
-    const found = [...segmentVerdicts(segment, decoded, sets), migrate, guardWrites(list, dir)];
+    const found = [...segmentVerdicts(segment, decoded, sets), migrate, guardWrites(list, dir, guard)];
     // The same words with the variables this line set earlier filled in (`c=x; pnpm $c tick`), read by the same text rules;
     // and a write whose target is a pattern that could name a set's marker file (markerWrites()).
     const fill = filledWith(lineEnv);
@@ -1506,8 +1529,8 @@ const evaluateLine = (command, options) => {
       found.push(...segmentVerdicts(fill(segment), foldAscii([filledList.join(" "), ...heredocText].join("\n")), sets));
     }
     found.push(markerWrites(filledList, sets.markerFiles));
-    // A guard file named through a variable the line set (`d=scripts/command-guard.sets; rm -rf $d`).
-    if (filledList.some((word, index) => word !== list[index])) found.push(guardWrites(filledList, dir));
+    // A guard file named through a variable the line set (`d=.reins; rm -rf $d`).
+    if (filledList.some((word, index) => word !== list[index])) found.push(guardWrites(filledList, dir, guard));
     // A pre-push opt-out (a set's `pushEnvDeny`), set for this push in front of it, earlier on the line, or as the command's own prefix.
     const skipping = sets.pushEnvDeny.find((name) => inline.has(name) || (lineEnv.has(name) && lineEnv.get(name) !== UNSET) || segment.trim().startsWith(`${name}=`));
     const skipDeny = () => deny(`${skipping} skips the pre-push checks; only the user bypasses them.`);
@@ -1515,7 +1538,7 @@ const evaluateLine = (command, options) => {
     if (skipping !== undefined && (/\bgit\b.*\bpush\b/.test(segment) || /\bgit\b.*\bpush\b/.test(decoded))) found.push(skipDeny());
     // A data store's own delete (FLUSHALL, dropDatabase, a remote D1 DROP), judged by where it points;
     // on another machine, its "localhost" is that machine's.
-    found.push(evaluateStore(programArgv(list.slice(start)), { text: `${before?.head ?? ""}\n${segment}`, readFile: (path) => readSqlAt(dir, path), remote }));
+    found.push(evaluateStore(programArgv(list.slice(start)), { text: `${before?.head ?? ""}\n${segment}`, readFile: (path) => readSqlAt(dir, path), remote }), ownPackage(list));
     // Each program the command runs, past its wrappers: the policy table, then the push, git
     // config, and gh api rules. `git -C X …` runs in X for that program only (each `-C` from the one
     // before); `--git-dir` or `--work-tree` points it at a repository whose branch isn't looked up.
@@ -1610,6 +1633,22 @@ const MERGE_ASK = "Merging needs the user's OK for this batch.";
 const RERUN_DENY = "Rerun only the failed jobs: `gh run rerun <id> --failed`, after reading the failure.";
 const PATTERN_KILL_DENY = "A pattern kill (`pkill -f`, or `pkill`/`killall` of node or a browser) also hits other agents' runs on this machine. Kill by the PID you started.";
 const DISPATCH_ASK = "A manual workflow run bills the full suite; say what it is for.";
+// A package manager's verbs that add, remove, move, or patch a named package.
+const PACKAGE_VERBS = new Set(["add", "remove", "rm", "uninstall", "un", "unlink", "link", "ln", "update", "up", "upgrade", "install", "i", "in", "isntall", "patch", "patch-commit"]);
+const PACKAGE_MANAGERS = new Set(["pnpm", "npm", "yarn", "bun"]);
+
+// Ask when a package manager adds, removes, updates, or patches the guard's own package (`reins`,
+// `reins@1.2.3`): what judges every command after it would change. `list` is the command's words;
+// assignments and prefixes (`sudo`, `env`) in front are read past.
+const ownPackage = (list) => {
+  let at = 0;
+  while (at < list.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(list[at] ?? "") || PREFIXES.has(programName(list[at] ?? "")))) at += 1;
+  if (!PACKAGE_MANAGERS.has(programName(list[at] ?? "").replace(/\.(exe|cmd)$/i, ""))) return null;
+  const words = list.slice(at + 1).filter((word) => !word.startsWith("-"));
+  if (!words.some((word) => PACKAGE_VERBS.has(word.toLowerCase()))) return null;
+  return words.some((word) => word.toLowerCase() === PACKAGE_NAME || word.toLowerCase().startsWith(`${PACKAGE_NAME}@`)) ? ask(OWN_PACKAGE_ASK) : null;
+};
+const OWN_PACKAGE_ASK = "This changes the guard's own package, which judges every command after it: the user confirms, and the change goes in a reviewed PR.";
 const DELETE_DENY = "Deleting data, a backup, or a key is a human action. Hand the user the exact command and what it destroys.";
 
 // The built-in git and GitHub acts, in a project rule's shape: `match` reads each program the
@@ -1781,9 +1820,11 @@ const evaluatePush = (/** @type {string[]} */ argv, /** @type {() => string} */ 
     const pr = frozenOf(marker.file);
     if (pr !== null) return deny(marker.reason.replaceAll("{pr}", () => (pr === "" ? "" : ` #${pr}`)));
   }
-  // Pushing main deploys production; fine on the user's "ship it", so the user confirms here.
-  if (hits.includes("main")) {
-    return ask("Pushing main ships to production: only on the user's \"ship it\".");
+  // A branch the project asks about before any push (`askOnPush`; main and master by default):
+  // pushing it usually ships production, so the user confirms here.
+  const asked = [...new Set(targets.filter((name) => askOnPushOf(branches).has(name)))];
+  if (asked.length > 0) {
+    return ask(`Pushing ${asked.join("/")} usually ships to production: the user confirms it.`);
   }
   return null;
 };
@@ -1918,10 +1959,11 @@ const evaluateGhApi = (argv, segment, branches, sets) => {
     const forced = fields.some((field) => /^force=(true|1)$/i.test(field));
     if (method === "DELETE" || forced) return deny(`${method === "DELETE" ? "Deleting" : "Force-moving"} ${ref} is never an agent's call. Force-push only your own feature branch.`);
     if (branches.workflowOnly.has(ref)) return deny(`Only its own workflow moves ${ref}; an agent never does.`);
-    if (ref === "main") return ask("Moving main ships to production: only on the user's \"ship it\".");
+    if (askOnPushOf(branches).has(ref)) return ask(`Moving ${ref} usually ships to production: the user confirms it.`);
     // A body from `--input` may say `"force": true`, which the guard doesn't open.
     if (input !== "") return ask(`This moves ${ref} with a body the guard doesn't read (\`--input\`), which may force it: confirm it doesn't.`);
   }
+  if (ref !== "" && askOnPushOf(branches).has(ref)) return ask(`Moving ${ref} usually ships to production: the user confirms it.`);
   const renamed = /\/branches\/([^/]+)\/rename$/.exec(path)?.[1] ?? "";
   if (branches.protected.has(renamed)) return deny(`Renaming ${renamed} deletes it under the name everything builds on; a human does it.`);
   if (/\/branches\/[^/]+\/protection\b/.test(path) || /\/rulesets\b/.test(path)) {
@@ -2098,19 +2140,37 @@ const markerWrites = (list, markerFiles = []) => {
 
 // The guard's own files, from the repo root: what a shell write to them (an edit, a move, a delete, a
 // chmod) could switch off. The hook doesn't see the Edit and Write tools (those show in the diff);
-// this catches the shell's road to the same files. GUARD_FILE matches one by its path's end, so an absolute path counts too, and in any case (a Mac's file system folds it).
-const GUARD_FILES = ["scripts/command-guard.mjs", "scripts/command-guard-hook.mjs", "scripts/command-guard.d", "scripts/command-guard.sets", "scripts/command-guard.pin.json", "command-guard.project.json", "harness.project.json", ".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json"];
-const GUARD_FILE = /(^|\/)(scripts\/command-guard[^/]*\.mjs|scripts\/command-guard\.d(\/.*)?|scripts\/command-guard\.sets(\/.*)?|scripts\/command-guard\.pin\.json|command-guard\.project\.json|harness\.project\.json|\.claude\/settings(\.local)?\.json|\.cursor\/hooks\.json)$/i;
+// this catches the shell's road to the same files. The core's list is its config file, its rule
+// folder and branch file when the caller names them (`files`), the hook configs, and the installed
+// package; a rule set's `guardFiles` adds its own. A path ending in `/` is a folder: a path inside
+// it is a guard file too. compileGuard() builds the matcher: one by its path's end, so an absolute
+// path counts too, and in any case (a Mac's file system folds it).
+const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`];
+
+// The matcher for a list of guard paths (folders end in `/`): `files` (lowercased, no trailing `/`),
+// `dirs` (the folders among them), and `match` (a path that is one, or inside a folder that is one).
+const compileGuard = (paths) => {
+  const unique = [...new Set(paths.map((path) => path.toLowerCase()))];
+  const files = unique.map((path) => path.replace(/\/+$/, ""));
+  const dirs = new Set(unique.filter((path) => path.endsWith("/")).map((path) => path.replace(/\/+$/, "")));
+  const escape = (path) => path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const alternatives = files.map((path) => (dirs.has(path) ? `${escape(path)}(\\/.*)?` : escape(path)));
+  return { files, dirs, match: new RegExp(`(^|\\/)(${alternatives.join("|")})$`, "i") };
+};
+
+// The core's guard files with nothing configured: the default config file and the hook configs.
+let defaultGuardFiles = null;
+const defaultGuard = () => {
+  defaultGuardFiles ??= compileGuard([DEFAULT_FILES.config, ...HOOK_FILES]);
+  return defaultGuardFiles;
+};
 
 // Programs that delete, move, or change the mode of their operands (writes() reads what writes files).
 const REMOVERS = /^(rm|unlink|shred|mv|chmod|chown|chattr|chflags|truncate)$/;
 
-// True when a relative folder path holds one of GUARD_FILES (`.claude`, `scripts`); `.` and paths
+// True when a relative folder path holds one of the guard's files (`.claude`, `node_modules`); `.` and paths
 // outside the repo don't count (`rm -rf .` is refused by rm itself).
-const holdsGuardFile = (path) => !isAbsolute(path) && !path.startsWith("..") && path !== "." && GUARD_FILES.some((file) => file.startsWith(`${path.toLowerCase()}/`));
-
-// The folders in GUARD_FILES: a path inside one is a guard file too.
-const GUARD_DIRS = new Set(["scripts/command-guard.d", "scripts/command-guard.sets"]);
+const holdsGuardFile = (path, guard) => !isAbsolute(path) && !path.startsWith("..") && path !== "." && guard.files.some((file) => file.startsWith(`${path.toLowerCase()}/`));
 
 // A word's brace expansion, as the shell makes it before globbing (`x.{sets,d}` is `x.sets` and
 // `x.d`); null past 64 words, which the caller reads as a match. `{a..z}` is left for globSegment().
@@ -2158,27 +2218,27 @@ const globSegment = (segment) => {
   return new RegExp(`^${parts.join("")}$`, "i");
 };
 
-// True when a write's target, as the shell expands its braces and globs (`scripts/command-guard.s*/x`,
-// `command-guard.{sets,d}/x`), could be one of GUARD_FILES, a file in one of GUARD_DIRS, or (relative)
+// True when a write's target, as the shell expands its braces and globs (`.rein*/x`,
+// `.claude/settings{,.local}.json`), could be one of the guard's files, a file in one of its folders, or (relative)
 // a folder holding one. A relative path is read from the repo root, as holdsGuardFile() reads it; any
-// other matches by its end, as GUARD_FILE does.
-const couldBeGuardFile = (path) => {
+// other matches by its end, as `guard.match` does.
+const couldBeGuardFile = (path, guard) => {
   const expanded = braceWords(path);
   if (expanded === null) return true;
   return expanded.some((each) => {
     const word = normalize(each).replace(/\/+$/, "");
-    if (!/[*?[]|\{[^{}]*\.\.[^{}]*\}/.test(word)) return GUARD_FILE.test(word) || holdsGuardFile(word);
+    if (!/[*?[]|\{[^{}]*\.\.[^{}]*\}/.test(word)) return guard.match.test(word) || holdsGuardFile(word, guard);
     const raw = word.split("/").filter((segment) => segment !== "");
     const segments = raw.map(globSegment);
     const rooted = !isAbsolute(word) && !word.startsWith("~") && !word.startsWith("..");
-    // Outside the repo root, a root-level name (harness.project.json) needs 3 literal characters
+    // Outside the repo root, a root-level name (reins.json) needs 3 literal characters
     // besides `.json` in its glob, so `rm /tmp/*.json` isn't asked about.
     const loose = !rooted && (raw.at(-1) ?? "").replace(/\.json$/i, "").replace(/\{[^{}]*\}|\[[^\]]*\]|[*?]/g, "").length < 3;
-    return GUARD_FILES.some((file) => {
+    return guard.files.some((file) => {
       const parts = file.split("/");
       if (loose && parts.length === 1) return false;
       const fits = (from) => parts.every((part, index) => from + index >= segments.length || (segments[from + index]?.test(part) ?? false));
-      const ends = (from) => from + parts.length === segments.length || (from + parts.length < segments.length ? GUARD_DIRS.has(file) : rooted);
+      const ends = (from) => from + parts.length === segments.length || (from + parts.length < segments.length ? guard.dirs.has(file) : rooted);
       if (rooted) return segments.length > 0 && fits(0) && ends(0);
       for (let from = 0; from + parts.length <= segments.length; from += 1) if (fits(from) && ends(from)) return true;
       return false;
@@ -2189,7 +2249,7 @@ const couldBeGuardFile = (path) => {
 // An ask when this command writes, moves, or deletes one of the guard's files, or a folder that holds
 // one (`rm -rf .claude`); `dir` is where it runs (null for the hook's cwd). Still unread: a write
 // from inside an interpreter (`node -e`, `python3 -c`), `find -delete`, and an archive's `-C`/`-d`.
-const guardWrites = (headWords, dir) => {
+const guardWrites = (headWords, dir, guard) => {
   const start = programStart(headWords);
   const program = programName(headWords[start] ?? "");
   const operands = headWords.slice(start + 1).filter((word) => !word.startsWith("-"));
@@ -2200,8 +2260,8 @@ const guardWrites = (headWords, dir) => {
   const gitDir = (git?.dirs ?? []).reduce((from, target) => (isAbsolute(target) ? target : join(from ?? "", target)), dir);
   const gitWrites = /^(rm|mv|checkout|restore)$/.test(gitArgs[0] ?? "") ? gitArgs.slice(1).map((path) => fileKey(gitDir, path)) : [];
   const paths = [...[...writes(headWords), ...(REMOVERS.test(program) ? operands : [])].map((path) => fileKey(dir, path)), ...gitWrites].map((path) => path.replace(/\/+$/, ""));
-  if (!paths.some((path) => GUARD_FILE.test(path) || holdsGuardFile(path) || couldBeGuardFile(path))) return null;
-  return ask("This command writes, moves, or deletes one of the guard's own files (scripts/command-guard*.mjs, its rule files, harness.project.json, or the hook config in .claude/settings.json or .cursor/hooks.json): a change to the guard is the user's call, in a reviewed PR.");
+  if (!paths.some((path) => guard.match.test(path) || holdsGuardFile(path, guard) || couldBeGuardFile(path, guard))) return null;
+  return ask("This command writes, moves, or deletes one of the guard's own files (its config, its rule files, its installed package, or the hook config in .claude/settings.json or .cursor/hooks.json): a change to the guard is the user's call, in a reviewed PR.");
 };
 
 // "loopback" when every host is this machine, "remote" when any isn't, "unknown" when there are none.
@@ -4008,28 +4068,105 @@ const ruleVerdict = (make, rule) => {
   return make === deny && !rule.project && !rule.set ? liftable(verdict) : verdict;
 };
 
-// Why every command is refused when a rule file, pack, or set doesn't load, naming it.
-const loadError = (file, error) => `${file} didn't load (${error instanceof Error ? error.message : String(error)}), so every shell command is refused. Stop and tell the user: they fix the file or set WHIPPLETREE_GUARD=off. Don't edit guard rules to get a command through.`;
+// Why every command is refused when a rule file, pack, or set doesn't load, naming it. `off` is the
+// off switch's name (the first of `offEnv`), so the message names one that works for this caller.
+const loadError = (file, error, off = DEFAULT_OFF_ENV[0]) => `${file} didn't load (${error instanceof Error ? error.message : String(error)}), so every shell command is refused. Stop and tell the user: they fix the file or set ${off}=off. Don't edit guard rules to get a command through.`;
 
-// Loads the rule sets (`sets`: names in this script's folder, or .json paths; GUARD_SETS by default),
-// then the protected branches from harness.project.json, then the pack files (name order) and the
-// project file from the repo root. Never throws: an absent project or pack file adds nothing, and a
-// file that is present but broken, or a set that doesn't load, comes back as `error`. `loaded`
-// names the sets read; `sets` is them, compiled (loadSets()).
-export const loadRules = (root, { sets: names = GUARD_SETS } = {}) => {
-  const sets = loadSets(names);
-  if (sets.error !== "") return { ...NO_RULES, sets, loaded: [], error: sets.error };
-  const rules = { deny: [], ask: [], allow: new Set(), branches: sets.branches, sets, loaded: sets.loaded, error: "" };
+// The `files` option checked against DEFAULT_FILES: each key known, each value a relative path or
+// null. Throws naming the key, so a misspelt one refuses every command instead of dropping a file.
+const filesOf = (files) => {
+  if (!isRecord(files)) throw new Error("the files option must be an object");
+  onlyKeys(files, Object.keys(DEFAULT_FILES), "the files option");
+  const paths = { ...DEFAULT_FILES };
+  for (const [key, value] of Object.entries(files)) {
+    if (value !== null) relativePath(value, `files.${key}`);
+    paths[key] = value;
+  }
+  return paths;
+};
+
+// A path inside the project, written relative to its root: no `..`, no absolute path, no shell syntax.
+const relativePath = (value, at) => {
+  const path = nonEmpty(value, at);
+  if (isAbsolute(path) || path.split(/[\\/]/).includes("..") || /[*?[\]{}$`~\n]/.test(path)) throw new Error(`${at} must be a path inside the project, relative to its root`);
+  return path;
+};
+
+// The config file's knobs, checked (CONFIG_KEYS); its deny, ask, and allow are read later by
+// parseRules(), once the sets are loaded. Throws naming the bad field.
+const parseConfig = (text) => {
+  const data = JSON.parse(text);
+  if (!isRecord(data)) throw new Error("the top level must be an object");
+  onlyKeys(data, CONFIG_KEYS, "the top level");
+  const twice = duplicateKey(text);
+  if (twice !== null) throw new Error(`"${twice}" appears twice in one object`);
+  const sets = listOf(data, "sets").map((name, index) => {
+    if (typeof name !== "string" || !BUNDLED_SETS.includes(name)) throw new Error(`sets[${index}] is not a bundled rule set (${BUNDLED_SETS.join(", ")})`);
+    return name;
+  });
+  return {
+    data,
+    sets: data["sets"] === undefined ? null : sets,
+    ruleDir: data["ruleDir"] === undefined ? null : relativePath(data["ruleDir"], "ruleDir"),
+    protectedBranches: data["protectedBranches"] === undefined ? null : branchNames(data["protectedBranches"], "protectedBranches"),
+    askOnPush: data["askOnPush"] === undefined ? null : branchList(data["askOnPush"], "askOnPush"),
+    askTags: data["askTags"] === undefined ? null : askTagsOf(data["askTags"]),
+  };
+};
+
+// The ask gate's settings (askTags): `tags` (the reasons a question may reach the user), and
+// optional `refusal` (the text an untagged question gets), `tools` (the tool names it judges; all
+// when absent), `log` (a JSONL file each question is recorded in; `~/` is the home folder).
+export const askTagsOf = (value) => {
+  if (!isRecord(value)) throw new Error('"askTags" must be an object');
+  onlyKeys(value, ["tags", "refusal", "tools", "log"], "askTags");
+  const tags = value["tags"];
+  if (!Array.isArray(tags) || tags.length === 0 || !tags.every((tag) => typeof tag === "string" && /^[\w-]+$/.test(tag))) throw new Error('"askTags.tags" must be a non-empty array of tags (letters, digits, - and _)');
+  const tools = value["tools"] === undefined ? null : typeof value["tools"] === "string" ? [value["tools"]] : value["tools"];
+  if (tools !== null && (!Array.isArray(tools) || tools.length === 0 || !tools.every((tool) => typeof tool === "string" && tool !== ""))) throw new Error('"askTags.tools" must be a tool name or a non-empty array of them');
+  return { tags, refusal: optional(value, "refusal", "askTags"), tools, log: optional(value, "log", "askTags") };
+};
+
+// Loads, from the project root: the config (`files.config`, reins.json), the rule sets it or the
+// caller names (`sets`; the caller's list wins; none by default), the protected branches, then the
+// pack files (`ruleDir`, name order). Never throws: an absent config or pack file adds nothing, and
+// a file that is present but broken, a set that doesn't load, or an unknown `files` key comes back
+// as `error`. `loaded` names the sets read; `sets` is them, compiled (loadSets()); `guard` is the
+// guard's own files (compileGuard()); `askTags` the config's ask-gate settings, or null.
+export const loadRules = (root, { files = {}, sets: names, offEnv = DEFAULT_OFF_ENV } = {}) => {
+  const off = offEnv[0] ?? DEFAULT_OFF_ENV[0];
   // Which file is being read, so the error names it.
-  let file = HARNESS_PROJECT;
+  let file = "the files option";
   try {
-    rules.branches = protectedBranches(readRuleFile(join(root, HARNESS_PROJECT)), sets.branches);
-    for (file of [...packFiles(root), PROJECT_RULES]) {
-      const text = readRuleFile(join(root, file));
+    const paths = filesOf(files);
+    file = paths.config ?? "the config";
+    const configText = paths.config === null ? null : readRuleFile(join(root, paths.config));
+    const config = configText === null ? null : parseConfig(configText);
+    const setNames = names ?? config?.sets ?? [];
+    if (!Array.isArray(setNames)) throw new Error("the sets option must be an array");
+    const sets = loadSets(setNames, off);
+    if (sets.error !== "") return { ...NO_RULES, sets, loaded: [], askTags: null, error: sets.error };
+    const ruleDir = config?.ruleDir ?? paths.ruleDir;
+    const guard = compileGuard([...[paths.config, paths.branches].filter((path) => path !== null), ...(ruleDir === null ? [] : [`${ruleDir}/`]), ...HOOK_FILES, ...sets.guardFiles]);
+    let branches = sets.branches;
+    if (config?.protectedBranches) branches = { ...branches, protected: new Set(config.protectedBranches) };
+    if (config?.askOnPush) branches = { ...branches, askOnPush: new Set(config.askOnPush) };
+    if (paths.branches !== null) {
+      file = paths.branches;
+      const named = protectedBranches(readRuleFile(join(root, paths.branches)));
+      if (named !== null && config?.protectedBranches) throw new Error(`"protectedBranches" is also set in ${paths.config}; name it in one file`);
+      if (named !== null) branches = { ...branches, protected: new Set(named) };
+    }
+    const rules = { deny: [], ask: [], allow: new Set(), branches, sets, guard, loaded: sets.loaded, askTags: config?.askTags ?? null, error: "" };
+    // The pack files, then the config's own rules (the project's: it alone may hold `allow`).
+    const read = [...(ruleDir === null ? [] : packFiles(root, ruleDir).map((name) => ({ name, text: null }))), ...(configText === null ? [] : [{ name: paths.config, text: configText }])];
+    for (const each of read) {
+      file = each.name;
+      const project = each.text !== null;
+      const text = each.text ?? readRuleFile(join(root, each.name));
       // Absent: nothing to add.
       if (text === null) continue;
-      const project = file === PROJECT_RULES;
-      const parsed = parseRules(text, { project, branches: rules.branches, sets });
+      const parsed = parseRules(text, { project, branches, sets, guard, extraKeys: project ? CONFIG_KEYS : [] });
       // Each rule keeps its file (named in its reason) and whether an exemption may lift it.
       rules.deny.push(...parsed.deny.map((rule) => ({ ...rule, file, project })));
       rules.ask.push(...parsed.ask.map((rule) => ({ ...rule, file, project })));
@@ -4037,7 +4174,7 @@ export const loadRules = (root, { sets: names = GUARD_SETS } = {}) => {
     }
     return rules;
   } catch (error) {
-    return { ...NO_RULES, error: loadError(file, error) };
+    return { ...NO_RULES, askTags: null, error: loadError(file, error, off) };
   }
 };
 
@@ -4049,14 +4186,17 @@ const branchNames = (list, key) => {
   return list;
 };
 
-// The branches harness.project.json protects (`"protectedBranches": ["main", "dev"]`), or the rule
-// sets' (`fallback`) when it names none. Only that key is the guard's: the file's other keys are
-// its own tooling's. A list that isn't one of branch names throws. The workflow-only branches stay the sets'.
-const protectedBranches = (text, fallback) => {
-  if (text === null) return fallback;
+// The same, where an empty list is a choice (`askOnPush: []` asks on no push).
+const branchList = (list, key) => (Array.isArray(list) && list.length === 0 ? list : branchNames(list, key));
+
+// The branches the `branches` file protects (`"protectedBranches": ["main", "dev"]`), or null when it
+// is absent or names none. Only that key is the guard's: the file's other keys are its own
+// tooling's. A list that isn't one of branch names throws.
+const protectedBranches = (text) => {
+  if (text === null) return null;
   const data = JSON.parse(text);
-  if (!isRecord(data) || data["protectedBranches"] === undefined) return fallback;
-  return { protected: new Set(branchNames(data["protectedBranches"], "protectedBranches")), workflowOnly: fallback.workflowOnly };
+  if (!isRecord(data) || data["protectedBranches"] === undefined) return null;
+  return branchNames(data["protectedBranches"], "protectedBranches");
 };
 
 // ── Rule sets: a team's own rules as data (sets/*.json) ──
@@ -4087,22 +4227,27 @@ const protectedBranches = (text, fallback) => {
 //   refused off `allowOn` (`{branch}` in the reason names it), asked about when the branch can't be read.
 // - `pushEnvDeny`: [name], a variable that skips the pre-push checks, refused on a push.
 // - `gitConfigAsk`: [{ key, reason }], a git setting that asks when set (on a command or in config).
-const SET_KEYS = ["$comment", "deny", "ask", "protectedBranches", "workflowOnlyBranches", "statusContexts", "repoVariables", "markerFiles", "freezeMarkers", "skipCi", "pushEnvDeny", "gitConfigAsk"];
+// - `guardFiles`: [path], more of the guard's own files, relative to the project root (a folder ends
+//   in `/`): a shell write to one asks, as a write to the config does.
+const SET_KEYS = ["$comment", "deny", "ask", "protectedBranches", "workflowOnlyBranches", "statusContexts", "repoVariables", "markerFiles", "freezeMarkers", "skipCi", "pushEnvDeny", "gitConfigAsk", "guardFiles"];
 
 // Every set merged, in order, with nothing in it: what loadSets() fills, and what a failed load holds.
-const noSets = () => ({ error: "", loaded: [], program: [], segment: [], deny: [], ask: [], protectedBranches: /** @type {string[] | null} */ (null), workflowOnly: [], statusContexts: [], repoVariables: [], markerFiles: [], freezeMarkers: [], skipCi: [], pushEnvDeny: [], gitConfigAsk: [], branches: { protected: new Set(CORE_PROTECTED), workflowOnly: new Set() } });
+const noSets = () => ({ error: "", loaded: [], program: [], segment: [], deny: [], ask: [], protectedBranches: /** @type {string[] | null} */ (null), workflowOnly: [], statusContexts: [], repoVariables: [], markerFiles: [], freezeMarkers: [], skipCi: [], pushEnvDeny: [], gitConfigAsk: [], guardFiles: [], branches: { protected: new Set(CORE_PROTECTED), workflowOnly: new Set(), askOnPush: CORE_ASK_ON_PUSH_SET } });
 
 // Where a set is: a bare name is the package's sets/`<name>.json`, never the hook's cwd; a path
 // ending in .json is that file (a test's copy). `label` names it in a reason or an error.
 const setFile = (name) => {
-  if (typeof name === "string" && /^[a-z0-9][a-z0-9-]*$/.test(name)) return { path: fileURLToPath(new URL(`../sets/${name}.json`, import.meta.url)), label: `${SET_DIR}/${name}.json` };
+  if (typeof name === "string" && /^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    if (!BUNDLED_SETS.includes(name)) throw new Error(`"${name}" is not a bundled rule set (${BUNDLED_SETS.join(", ")})`);
+    return { path: fileURLToPath(new URL(`../sets/${name}.json`, import.meta.url)), label: `${SET_DIR}/${name}.json` };
+  }
   if (typeof name === "string" && name.endsWith(".json")) return { path: resolve(name), label: name };
   throw new Error(`${JSON.stringify(name)} is not a rule set's name or a .json path`);
 };
 
 // Loads and merges the named sets, in order, then POLICY behind their program rows. Never throws:
 // a set that is missing, unreadable, or broken comes back as `error`, naming it.
-const loadSets = (names) => {
+const loadSets = (names, off) => {
   const sets = noSets();
   let file = SET_DIR;
   try {
@@ -4114,21 +4259,21 @@ const loadSets = (names) => {
       const set = parseSet(text, label);
       if (set.protectedBranches !== null && sets.protectedBranches !== null) throw new Error('"protectedBranches" is already set by an earlier rule set');
       sets.protectedBranches ??= set.protectedBranches;
-      for (const key of ["program", "segment", "deny", "ask", "workflowOnly", "statusContexts", "repoVariables", "markerFiles", "freezeMarkers", "skipCi", "pushEnvDeny", "gitConfigAsk"]) sets[key].push(...set[key]);
+      for (const key of ["program", "segment", "deny", "ask", "workflowOnly", "statusContexts", "repoVariables", "markerFiles", "freezeMarkers", "skipCi", "pushEnvDeny", "gitConfigAsk", "guardFiles"]) sets[key].push(...set[key]);
       sets.loaded.push(name);
     }
   } catch (error) {
-    return { ...noSets(), error: loadError(file, error) };
+    return { ...noSets(), error: loadError(file, error, off) };
   }
   sets.program.push(...POLICY);
-  sets.branches = { protected: new Set(sets.protectedBranches ?? CORE_PROTECTED), workflowOnly: new Set(sets.workflowOnly) };
+  sets.branches = { protected: new Set(sets.protectedBranches ?? CORE_PROTECTED), workflowOnly: new Set(sets.workflowOnly), askOnPush: CORE_ASK_ON_PUSH_SET };
   return sets;
 };
 
-// The default sets (GUARD_SETS), loaded once, for a caller whose rules carry none.
+// No rule sets (the core alone, POLICY included), loaded once, for a caller whose rules carry none.
 let defaultLoaded = null;
 const defaultSets = () => {
-  defaultLoaded ??= loadSets(GUARD_SETS);
+  defaultLoaded ??= loadSets([]);
   return defaultLoaded;
 };
 
@@ -4190,6 +4335,7 @@ const parseSet = (text, file) => {
     if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`pushEnvDeny[${index}] must be a variable name`);
     return name;
   });
+  set.guardFiles = listOf(data, "guardFiles").map((path, index) => relativePath(path, `guardFiles[${index}]`));
   set.gitConfigAsk = listOf(data, "gitConfigAsk").map((entry, index) => {
     const at = `gitConfigAsk[${index}]`;
     knobEntry(entry, ["key", "reason"], at);
@@ -4242,12 +4388,12 @@ const fileName = (value, at) => {
   return name;
 };
 
-// The pack rule files, by name; none when the directory isn't there.
-const packFiles = (root) => {
+// The pack rule files in `dir`, by name; none when the directory isn't there.
+const packFiles = (root, dir) => {
   try {
-    return readdirSync(join(root, PACK_RULES)).filter((name) => name.endsWith(".json")).toSorted().map((name) => `${PACK_RULES}/${name}`);
+    return readdirSync(join(root, dir)).filter((name) => name.endsWith(".json")).toSorted().map((name) => `${dir}/${name}`);
   } catch (error) {
-    if (isMissing(error, join(root, PACK_RULES))) return [];
+    if (isMissing(error, join(root, dir))) return [];
     throw error;
   }
 };
@@ -4282,12 +4428,13 @@ const SHELL_SYNTAX = /[$`&;|<>(){}[\]*?~\n]/;
 
 // Checks one rule file and compiles its patterns. Throws a message naming the bad field: an unknown
 // key, a missing reason, or a pattern that doesn't compile would otherwise drop a rule silently.
-// Exemptions (`allow`) belong to the project file only; a pack can only refuse or ask.
-const parseRules = (text, { project, branches, sets }) => {
+// Exemptions (`allow`) belong to the project file only; a pack can only refuse or ask. `extraKeys`
+// are the config's knobs, which share its file (parseConfig() reads them).
+const parseRules = (text, { project, branches, sets, guard, extraKeys = [] }) => {
   const data = JSON.parse(text);
   if (!isRecord(data)) throw new Error("the top level must be an object");
   const kinds = project ? ["deny", "ask", "allow"] : ["deny", "ask"];
-  onlyKeys(data, [...kinds, "$comment"], "the top level");
+  onlyKeys(data, [...kinds, "$comment", ...extraKeys], "the top level");
   // JSON.parse keeps only the last of two same-named keys, so a second "deny" block or "match" would erase the first.
   const twice = duplicateKey(text);
   if (twice !== null) throw new Error(`"${twice}" appears twice in one object`);
@@ -4297,7 +4444,7 @@ const parseRules = (text, { project, branches, sets }) => {
     return value.map((entry, index) => {
       const at = `${kind}[${index}]`;
       if (!isRecord(entry)) throw new Error(`${at} must be an object`);
-      return kind === "allow" ? exemption(entry, at, branches, sets) : rule(entry, at);
+      return kind === "allow" ? exemption(entry, at, branches, sets, guard) : rule(entry, at);
     });
   };
   return { deny: list("deny"), ask: list("ask"), allow: project ? list("allow") : [] };
@@ -4319,7 +4466,7 @@ const rule = (entry, at) => {
 
 // An exemption: one literal command, compared word for word (its tokens as one string that keeps
 // their boundaries, so `a "b c"` and `a b c` differ), so it can't widen to another path or verb.
-const exemption = (entry, at, branches, sets) => {
+const exemption = (entry, at, branches, sets, guard) => {
   onlyKeys(entry, ["command", "reason"], at);
   nonEmpty(entry["reason"], `${at}.reason`);
   const command = nonEmpty(entry["command"], `${at}.command`);
@@ -4329,7 +4476,7 @@ const exemption = (entry, at, branches, sets) => {
   // migration tools, any set's row or knob), so the file is broken.
   const key = JSON.stringify(words(command));
   for (const branch of [...branches.protected, ""]) {
-    const left = evaluate(command, { branch, branchIn: () => branch, rules: { ...NO_RULES, branches, sets, allow: new Set([key]) } });
+    const left = evaluate(command, { branch, branchIn: () => branch, rules: { ...NO_RULES, branches, sets, guard, allow: new Set([key]) } });
     if (left) throw new Error(`${at}.command meets a built-in rule an exemption can't lift: ${left.reason}`);
   }
   return key;
@@ -4382,16 +4529,23 @@ const pattern = (source, flags, at) => {
   }
 };
 
-// Which host called us decides the input and output shapes.
-const host = () => (process.argv[2] === "cursor" ? "cursor" : "claude");
+// The host a hook was called for decides the input and output shapes.
+const hostOf = (value) => (value === "cursor" ? "cursor" : "claude");
 
-// The human's off switch, for a session where the guard is in the way.
-const guardOff = () => process.env.WHIPPLETREE_GUARD === "off";
+// The human's off switch, for a session where the guard is in the way: any `offEnv` name set to `off`.
+const guardOff = (offEnv = DEFAULT_OFF_ENV) => offEnv.some((name) => process.env[name] === "off");
 
 // The ask the watchdog gives when no verdict came in time.
-const watchdogAsk = () => ask(`command-guard didn't reach a verdict within its ${WATCHDOG_MS} ms watchdog, so it stopped reading; the user confirms this command. Tell the user if this repeats: something in the guard is slow.`);
+const watchdogAsk = () => ask(`The guard didn't reach a verdict within its ${WATCHDOG_MS} ms watchdog, so it stopped reading; the user confirms this command. Tell the user if this repeats: something in the guard is slow.`);
+
+// The project root a hook reads its config from: the caller's `root`, else the project folder the
+// host exports to hook processes (CLAUDE_PROJECT_DIR, CURSOR_PROJECT_DIR), else the hook's own cwd.
+// Never the payload's cwd, which moves with the agent.
+const rootOf = (root) => root ?? process.env["CLAUDE_PROJECT_DIR"] ?? process.env["CURSOR_PROJECT_DIR"] ?? process.cwd();
 
 // Hook entry point: stdin JSON in, host-specific JSON out, always within WATCHDOG_MS.
+// Options: `host` ("claude" or "cursor"; default argv[2]), `root`, `files`, `sets` (loadRules()),
+// `offEnv` (the off switch's names; DEFAULT_OFF_ENV).
 //
 // The guard fails closed to ask, never to allow: the host's own timeout (10 s) lets a command run,
 // so a guard bug must reach the user instead. A line over MAX_COMMAND_CHARS asks before it is
@@ -4405,14 +4559,16 @@ const watchdogAsk = () => ask(`command-guard didn't reach a verdict within its $
 // every command, and exit waits for a worker blocked in a system call, so it bounds nothing more.
 // Exported for the hook entry, which turns a guard that doesn't
 // load, or exits any other way than with an answer, into a block.
-export const main = () => {
+export const main = ({ host = hostOf(process.argv[2]), root, files, sets, offEnv = DEFAULT_OFF_ENV } = {}) => {
   const started = performance.now();
+  const off = () => guardOff(offEnv);
+  const say = (verdict) => respond(verdict, hostOf(host));
   let answered = false;
   // Writes the first answer and exits; anything after it (the stdin timer) is a no-op.
   const answer = (verdict) => {
     if (answered) return;
     answered = true;
-    respond(verdict);
+    say(verdict);
     process.exit(0);
   };
   // Fail closed to ask: a guard bug must neither let the command through unseen nor wedge the
@@ -4423,16 +4579,16 @@ export const main = () => {
     if (answered) return;
     answered = true;
     const message = error instanceof Error ? error.message : String(error);
-    respond(guardOff() ? null : ask(`command-guard failed (${message}), so the user confirms this command. Tell the user: a guard bug must not let a command through unseen.`));
+    say(off() ? null : ask(`The guard failed (${message}), so the user confirms this command. Tell the user: a guard bug must not let a command through unseen.`));
     try {
-      writeSync(2, `command-guard: failed (${message})\n`);
+      writeSync(2, `reins: failed (${message})\n`);
     } catch {
       // Nowhere left to say it; the answer is already out.
     }
     process.exit(0);
   };
   // Started first, so it covers reading stdin too (a host that never closes it).
-  setTimeout(() => answer(guardOff() ? null : watchdogAsk()), WATCHDOG_MS);
+  setTimeout(() => answer(off() ? null : watchdogAsk()), WATCHDOG_MS);
   const chunks = [];
   process.stdin.on("data", (chunk) => chunks.push(chunk));
   process.stdin.on("error", failed);
@@ -4442,20 +4598,20 @@ export const main = () => {
       const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const raw = input?.tool_input?.command ?? input?.command;
       const cwd = String(input?.cwd ?? process.cwd());
-      if (guardOff()) {
+      if (off()) {
         answer(null);
         return;
       }
       // No command where the host puts one (a renamed field, a different tool's input): asking,
       // not reading "" and allowing, so a change in the host's shape can't switch the guard off.
       if (typeof raw !== "string") {
-        answer(ask("command-guard found no command in the hook's input (`tool_input.command` or `command`), so it couldn't read what will run; the user confirms. Tell the user: the host's hook input may have changed shape."));
+        answer(ask("The guard found no command in the hook's input (`tool_input.command` or `command`), so it couldn't read what will run; the user confirms. Tell the user: the host's hook input may have changed shape."));
         return;
       }
       const command = raw;
       // Whatever is left of the deadline; vm throws ERR_SCRIPT_EXECUTION_TIMEOUT when it runs out.
       const left = Math.max(1, Math.ceil(WATCHDOG_MS - (performance.now() - started)));
-      answer(runInNewContext("verdict()", { verdict: () => hookVerdict(command, cwd) }, { timeout: left }));
+      answer(runInNewContext("verdict()", { verdict: () => hookVerdict(command, cwd, { root, files, sets, offEnv }) }, { timeout: left }));
     } catch (error) {
       if (watchdogFired(error)) answer(watchdogAsk());
       else failed(error);
@@ -4464,8 +4620,10 @@ export const main = () => {
 };
 
 // main()'s evaluation, all of it under the watchdog: branch lookups, rule files, and evaluate().
+// `root` is where the config and the project's rule files are read (rootOf()); `files`, `sets`,
+// and `offEnv` go to loadRules().
 // Exported for a caller that judges the argv it is about to spawn the way the hook judges a typed command.
-export const hookVerdict = (command, cwd) => {
+export const hookVerdict = (command, cwd, { root, files, sets, offEnv } = {}) => {
   // The branch is read lazily, by the first rule that needs it (a push or commit parsed from the line, whatever
   // spelling got it there: `g''it`, `$'g\x69t'`, `sh -c "…"`), so a line that never pushes looks nothing up.
   const branch = () => currentBranch(cwd);
@@ -4547,18 +4705,18 @@ export const hookVerdict = (command, cwd) => {
       return "";
     }
   };
-  // Rule files live at the repo root, the parent of this script's directory, whatever the cwd.
-  const rules = loadRules(fileURLToPath(new URL("..", import.meta.url)));
+  // Rule files live at the project root, whatever the command's cwd.
+  const rules = loadRules(rootOf(root), { files, sets, offEnv });
   return evaluate(command, { branch, branchIn, shipFreezeIn, rules, targetIn, scriptIn, fileIn: readSql, dirIn, dirExists });
 };
 
 // Writes a verdict (or null, no opinion) in the calling host's shape. writeSync, not
 // process.stdout.write: a pipe's stdout is asynchronous on macOS, and main() exits right after.
-const respond = (verdict) => {
+export const respond = (verdict, host = "claude") => {
   // Cursor treats missing or invalid JSON as a block, so it always gets an answer.
-  if (host() === "cursor") {
+  if (host === "cursor") {
     const permission = verdict?.decision ?? "allow";
-    const message = verdict ? `command-guard: ${verdict.reason}` : undefined;
+    const message = verdict ? `reins: ${verdict.reason}` : undefined;
     writeSync(1, JSON.stringify({ permission, user_message: message, agent_message: message }));
     return;
   }
@@ -4571,35 +4729,9 @@ const respond = (verdict) => {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: verdict.decision,
-          permissionDecisionReason: `command-guard: ${verdict.reason}`,
+          permissionDecisionReason: `reins: ${verdict.reason}`,
         },
       }),
     );
   }
 };
-
-// True when Node was started on this file. Real paths on both sides: Node resolves symlinks for
-// import.meta.url but not for argv[1], so a project opened through a symlink would skip the guard silently.
-const isScript = () => {
-  try {
-    return process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-};
-
-// The first freeze marker's file name in the rule sets ("" when none), for the tests and
-// shipFreeze()'s default. Here, after everything loadSets() reads is defined.
-export const SHIP_FREEZE_FILE = defaultSets().freezeMarkers[0]?.file ?? "";
-
-// Run only as a script, so the test can import evaluate() without reading stdin.
-if (isScript()) {
-  // main() answers its own failures; this catches one before it is listening, still as an ask.
-  try {
-    main();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    respond(guardOff() ? null : ask(`command-guard failed (${message}), so the user confirms this command. Tell the user: a guard bug must not let a command through unseen.`));
-    process.exit(0);
-  }
-}
