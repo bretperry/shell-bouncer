@@ -112,8 +112,15 @@ describe("the core alone: a bare repo with no reins.json", () => {
     ["rm -rf node_modules/.pnpm/left-pad@1.3.0", null],
     [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}x@1.0.0`, null],
     ["rm node_modules/.bin/prisma", null],
-    // A plain push whose branch the shell fills in is read as before; a forced one asks (test/guard.test.mjs).
-    ["git push origin $B", null],
+    // A store folder named by a brace or a glob that could be the package's.
+    [`rm -rf node_modules/.pnpm/{${PACKAGE_NAME},x}@0.1.0`, "ask"],
+    [`rm -rf node_modules/.pnpm/${PACKAGE_NAME.slice(0, 2)}?${PACKAGE_NAME.slice(3)}@0.1.0`, "ask"],
+    ["rm -rf node_modules/.pnpm/*@0.1.0", "ask"],
+    ["rm -rf node_modules/.pnpm/left-pad*", null],
+    ["rm -rf node_modules/.pnpm/{left-pad,x}@1.3.0", null],
+    // A push whose branch the shell fills in asks, plain or forced, as `git push origin main` does
+    // (was null before the Phase 3 delta review; test/guard.test.mjs).
+    ["git push origin $B", "ask"],
     ["git push -f origin $B", "ask"],
   ];
   for (const [command, expected] of rows) {

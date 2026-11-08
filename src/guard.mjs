@@ -1495,6 +1495,12 @@ const evaluateLine = (command, options) => {
       if (target.via === "eval") loseTrack();
       const extra = SHELL.test(target.via ?? "") ? {} : (LINE_FLAGS[target.via ?? ""] ?? { lost: true, wrapped: true });
       for (const line of target.line === undefined ? fedLines(parsed, before) : [target.line]) follow(line, extra);
+      // `bash -c "$(echo git push …)"`, `eval "$X"`: the line as this shell builds it (builtLines()).
+      if (target.built === true && target.line !== undefined && (SHELL.test(target.via ?? "") || target.via === "eval")) {
+        const built = builtLines(target.line, filledWith(lineEnv));
+        if (built === null && target.via !== "eval") verdicts.push(ask(BUILT_LINE_ASK));
+        for (const line of built ?? []) follow(line, extra);
+      }
     }
     // `find … -exec X {} \;` (and -execdir, -ok, -okdir) runs X once per file, a wrapper the guard
     // reads only in outline (as judge()'s fallback reads others): a verdict on X asks.
@@ -1588,13 +1594,12 @@ const evaluateLine = (command, options) => {
       // push, git config, and `gh api` rules.
       const filledArgv = programArgv(program.map(fill));
       if (filledArgv.some((word, at) => word !== argv[at])) found.push(...policyVerdicts(filledArgv.join(" "), sets.program), pushVerdict(filledArgv), evaluateGitConfig(filledArgv, sets.gitConfigAsk), evaluateGhApi(filledArgv, fill(segment), branches, sets), evaluateGhVariable(filledArgv, sets.repoVariables));
-      // The program again as the shell expands its braces (`git push -f origin ma{in,x}`, `{git,push} …`);
-      // braceWords() lists a word's expansions last first.
+      // The program again as the shell expands its braces (`git push -f origin ma{in,x}`, `{git,push} …`,
+      // `m{a..b}in`), each way bracedArgvs() reads it; too many words to read asks.
       const words = programWords[index] ?? [];
-      if (words.some((word) => word.brace)) {
-        const braced = programArgv(words.flatMap((word) => (word.brace ? (braceWords(word.value)?.reverse() ?? [word.value]) : [word.value])));
-        found.push(...policyVerdicts(braced.join(" "), sets.program), pushVerdict(braced), evaluateGitConfig(braced, sets.gitConfigAsk));
-      }
+      const bracings = bracedArgvs(words);
+      if (bracings === null) found.push(ask(BRACE_TOO_MANY_ASK));
+      for (const braced of bracings ?? []) found.push(...policyVerdicts(braced.join(" "), sets.program), pushVerdict(braced), evaluateGitConfig(braced, sets.gitConfigAsk));
       // What the shell fills in where the git and gh rules read a word by name (unreadGit()).
       found.push(unreadGit(words, fill, branches, pushVerdict));
       if (gitEnv && argv[0] === "git") found.push(ask(GIT_CONFIG_ENV_ASK));
@@ -1683,6 +1688,23 @@ const MAX_FED_CHARS = 16 * 1024;
 const FED_TOO_LONG = "\0fed-too-long";
 const FED_TOO_LONG_ASK = `A shell here runs a script over ${MAX_FED_CHARS / 1024} KB that \`cat\` or \`<(…)\` prints, longer than the guard reads; the user confirms what it runs.`;
 
+// The lines a shell's `-c` string (or `eval`'s) runs when this shell filled part of it in: the
+// variables this line set, filled in by `fill`; for a string that is one substitution, what its
+// command prints, when the guard reads it (`"$(echo git push …)"`, as `echo … | sh` is read).
+// null when part of it stays unread (`"$X"`, `"$(cat f)"`, `"cd $D && make"`): the text there
+// could hold any command, so a shell running it asks (`eval` keeps its old reading, since
+// `eval "$(ssh-agent -s)"` and its like are everyday setup).
+const builtLines = (line, fill) => {
+  const filled = fill(line);
+  const sub = /^\$\(/.test(filled) ? closeParen(filled, 2) : filled.startsWith("`") ? closeTick(filled, 1) : -1;
+  if (sub === filled.length - 1) {
+    const printed = printedLines(filled.slice(filled.startsWith("`") ? 1 : 2, sub));
+    return printed.length === 0 ? null : printed;
+  }
+  return /[$`]/.test(filled) ? null : [filled];
+};
+const BUILT_LINE_ASK = "A shell here runs a command string built from a variable or a substitution the guard can't read; the user confirms what it runs.";
+
 // What the commands in a `<(…)` print, for a shell that runs it (`bash <(…)`, `source <(…)`).
 const printedLines = (text) => parseLine(text).commands.flatMap((command) => printedBy(command.tokens, command.heredocs, command.herestrings));
 
@@ -1700,17 +1722,34 @@ const findExecs = (words) => {
   return lines;
 };
 
-// GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>, GIT_CONFIG_PARAMETERS: git config set from the environment.
-const GIT_CONFIG_ENV = /^GIT_CONFIG_(COUNT|PARAMETERS|KEY_\w+|VALUE_\w+)$/;
-const GIT_CONFIG_ENV_ASK = "GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, or GIT_CONFIG_PARAMETERS sets git config for this git (an alias, core.hooksPath), which the guard doesn't read; the user confirms what it runs.";
+// A program's argv as the shell expands its braces (braceWords() lists a word's expansions last
+// first): [] when no word has braces, null when one makes too many words to read. Bash drops an
+// empty word an unquoted brace makes (`{git,} push` runs `git push`) but keeps a quoted one
+// (`""{a,}`), and the parsed word doesn't say which, so a list with an empty word is read both ways.
+const bracedArgvs = (words) => {
+  if (!words.some((word) => word.brace)) return [];
+  const lists = words.map((word) => (word.brace ? braceWords(word.value)?.reverse() ?? null : [word.value]));
+  if (lists.some((each) => each === null)) return null;
+  const kept = lists.flatMap((each) => each ?? []);
+  const dropped = lists.flatMap((each, at) => (words[at]?.brace ? (each ?? []).filter((value) => value !== "") : (each ?? [])));
+  return (dropped.length === kept.length ? [kept] : [kept, dropped]).map(programArgv);
+};
+const BRACE_TOO_MANY_ASK = "A brace expansion here makes more words than the guard reads (over 64); the user confirms what it runs.";
+
+// GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>, GIT_CONFIG_PARAMETERS: git config set
+// from the environment; GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM: a config file read in place of the
+// user's or the system's. (GIT_CONFIG_NOSYSTEM only skips one.)
+const GIT_CONFIG_ENV = /^GIT_CONFIG_(COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\w+|VALUE_\w+)$/;
+const GIT_CONFIG_ENV_ASK = "GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL, or GIT_CONFIG_SYSTEM sets git config for this git (an alias, core.hooksPath), which the guard doesn't read; the user confirms what it runs.";
 // A substitution that prints the branch a command runs on.
 const CURRENT_BRANCH = /^\$\(\s*git\s+(branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+(-q\s+)?HEAD)\s*\)$/;
 const UNREAD_GIT_ASK = "The git or gh command here, or the branch a forced or deleting push writes, comes from a variable or a substitution the guard can't read; the user confirms what it runs.";
 
 // Asks when the shell fills in, at run time, a word the git and gh rules read by name: the program
 // (`$G push …`, `$(which git) push …`), git's subcommand (`git $(echo push) …`), gh's (`gh $X merge`,
-// `gh pr $(echo merge)`), or a ref of a push that would be refused if it named a protected branch
-// (`git push -f origin "$(echo main)"`, `${B:-main}`). `words` is one program's parsed words;
+// `gh pr $(echo merge)`), or a ref of a push that would be refused or asked about if it named a
+// protected branch (`git push -f origin "$(echo main)"`, `${B:-main}`, `HEAD:"$B"`). Unread words
+// in front of a typed read-only subcommand (`git $GIT_FLAGS status`) don't ask. `words` is one program's parsed words;
 // `fill` fills in the variables this line set (a word it fills is read by the rules already);
 // `pushVerdict` judges a push's argv as evaluatePush() does.
 const unreadGit = (words, fill, branches, pushVerdict) => {
@@ -1725,7 +1764,14 @@ const unreadGit = (words, fill, branches, pushVerdict) => {
   }
   if (argv[0] !== "git") return null;
   const { sub } = gitGlobals(argv);
-  if (unread(words[sub])) return ask(UNREAD_GIT_ASK);
+  if (unread(words[sub])) {
+    // `git $GIT_FLAGS status`: unread words in front of a typed read-only subcommand are read as
+    // git's global options. (Were they a subcommand, the read-only word would be its argument.)
+    let next = sub;
+    while (next < words.length && unread(words[next])) next += 1;
+    const typed = words[next];
+    return typed !== undefined && !typed.dynamic && GIT_READ_ONLY.has(typed.value) ? null : ask(UNREAD_GIT_ASK);
+  }
   if (argv[sub] !== "push") return null;
   // `"$(git branch --show-current)"` is the branch it runs on, which the push rule reads as HEAD.
   const base = argv.map((value, at) => (at > sub && CURRENT_BRANCH.test(value) ? "HEAD" : value));
@@ -1740,11 +1786,15 @@ const unreadGit = (words, fill, branches, pushVerdict) => {
     if (colon !== -1) return /[$`]/.test(masked.slice(colon + 1)) ? `${value.slice(0, colon + 1)}${name}` : value;
     return `${value.startsWith("+") ? "+" : ""}${name}`;
   };
+  // A deny or an ask: `HEAD:"$(echo main)"` asks as `HEAD:main` does.
   for (const name of branches.protected) {
-    if (pushVerdict(base.map((value, at) => (spots.includes(at) ? asRef(value, name) : value)))?.decision === "deny") return ask(UNREAD_GIT_ASK);
+    const decision = pushVerdict(base.map((value, at) => (spots.includes(at) ? asRef(value, name) : value)))?.decision;
+    if (decision === "deny" || decision === "ask") return ask(UNREAD_GIT_ASK);
   }
   return null;
 };
+// git subcommands that only read: unread words in front of one are its global options (unreadGit()).
+const GIT_READ_ONLY = new Set(["status", "log", "diff", "show", "blame", "grep", "describe", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "show-ref", "for-each-ref", "name-rev", "merge-base", "whatchanged", "version", "help"]);
 
 // Each act's reason, shared by its gh subcommand and the API road to the same act. The gh
 // subcommands' rows for a ready PR, a rerun, and a dispatch are in the draft-flow and ci-minutes rule
@@ -1969,6 +2019,9 @@ const evaluateGitConfig = (argv, gitConfigAsk = []) => {
   };
   const aliasAsk = ask("A git alias runs whatever it is defined as, and the guard reads only the alias's name; the user confirms what it runs.");
   if (config.some((setting) => settingName(setting).startsWith("alias."))) return aliasAsk;
+  // `include.path` and `includeIf.<cond>.path` read another config file, which can hold an alias.
+  const includeAsk = ask("An include.path or includeIf setting reads git config from another file (an alias, core.hooksPath), which the guard doesn't read; the user confirms what it runs.");
+  if (config.some((setting) => INCLUDE_KEY.test(settingName(setting)))) return includeAsk;
   const configured = keyAsk(config.map(settingName));
   if (configured !== null) return configured;
   if (argv[sub] !== "config") return null;
@@ -1988,8 +2041,10 @@ const evaluateGitConfig = (argv, gitConfigAsk = []) => {
   if (!writes) return null;
   if (key === "core.hookspath") return ask("Setting core.hooksPath moves git's hooks folder, which can switch the pre-push guard off for every push after it; the user confirms.");
   if (key.startsWith("alias.")) return aliasAsk;
+  if (INCLUDE_KEY.test(key)) return includeAsk;
   return keyAsk([key]);
 };
+const INCLUDE_KEY = /^(include|includeif\..*)\.path$/;
 
 // gh api's options that take a value (the next word, `--name=value`, or glued to a short flag:
 // `-XDELETE`), and the ones that send a body, which makes its default method POST.
@@ -2293,6 +2348,21 @@ const STORE_FILES = STORES.map((store) => `${store.dir}/${store.name}/`);
 const STORE_KEY = new RegExp(`(^|/)(${STORES.map((store) => `${store.dir}/${store.name}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[^/]*`, "gi");
 // A path with any version of the package's store folder read as the one guard folder (STORES).
 const storeKey = (path) => path.replace(STORE_KEY, (_, lead, folder) => `${lead}${folder}`);
+// The store folders as compileGuard() lists them, for couldBeGuardFile()'s glob reading.
+const STORE_GUARDS = new Set(STORE_FILES.map((path) => path.toLowerCase().replace(/\/+$/, "")));
+
+// True when a glob segment could name a store folder starting with `prefix` (`re?ns@0.2.0`,
+// `*@0.2.0` for `reins@`): the version after the prefix can be anything, so a `*` reached before
+// the prefix ends could cover the rest; `?` and `[…]` take any one character.
+const globCouldStart = (segment, prefix) => {
+  let at = 0;
+  for (const [part] of segment.matchAll(GLOB_PART)) {
+    if (at >= prefix.length || part === "*" || (part.length > 1 && part.startsWith("{"))) return true;
+    if (part !== "?" && !(part.length > 1 && part.startsWith("[")) && part.toLowerCase() !== prefix[at]) return false;
+    at += 1;
+  }
+  return at >= prefix.length;
+};
 
 // The matcher for a list of guard paths (folders end in `/`): `files` (lowercased, no trailing `/`),
 // `dirs` (the folders among them), and `match` (a path that is one, or inside a folder that is one).
@@ -2314,13 +2384,16 @@ const defaultGuard = () => {
 
 // Programs that delete, move, or change the mode of their operands (writes() reads what writes files).
 const REMOVERS = /^(rm|unlink|shred|mv|chmod|chown|chattr|chflags|truncate)$/;
+// Programs that write over a file named last or in place, as `find -exec` hands them one (findDeletes()).
+const FIND_WRITERS = /^(cp|ln|install|tee|dd|rsync|sed|perl)$/;
 
 // True when a relative folder path holds one of the guard's files (`.claude`, `node_modules`); `.` and paths
 // outside the repo don't count (`rm -rf .` is refused by rm itself).
 const holdsGuardFile = (path, guard) => !isAbsolute(path) && !path.startsWith("..") && path !== "." && guard.files.some((file) => file.startsWith(`${path.toLowerCase()}/`));
 
 // A word's brace expansion, as the shell makes it before globbing (`x.{sets,d}` is `x.sets` and
-// `x.d`); null past 64 words, which the caller reads as a match. `{a..z}` is left for globSegment().
+// `x.d`, `m{a..c}` is `ma`, `mb`, and `mc`); null past 64 words, which every caller reads as a
+// match. A sequence bash leaves as typed (`{a..bc}`) stays for globSegment().
 const braceWords = (word) => {
   const done = [];
   const todo = [word];
@@ -2346,7 +2419,11 @@ const braceSplit = (word) => {
       if (char === "{") depth += 1;
       else if (char === "," && depth === 1) cuts.push(at);
       else if (char === "}" && --depth === 0) {
-        if (cuts.length === 1) break;
+        if (cuts.length === 1) {
+          const items = braceSequence(word.slice(open + 1, at));
+          if (items === null) break;
+          return items.map((item) => `${word.slice(0, open)}${item}${word.slice(at + 1)}`);
+        }
         cuts.push(at);
         return cuts.slice(1).map((cut, index) => `${word.slice(0, open)}${word.slice((cuts[index] ?? open) + 1, cut)}${word.slice(at + 1)}`);
       }
@@ -2355,9 +2432,34 @@ const braceSplit = (word) => {
   return null;
 };
 
+// The words a brace sequence's inside expands to, as bash 4 and later make them: `1..3`, `03..1`
+// (zero-padded), `1..9..2` (a step), `a..e`, `a..C` (by character code, so through the punctuation
+// between); null when it isn't one. Past 65 it stops, which braceWords() reads as too many.
+const braceSequence = (inside) => {
+  const numbers = /^([-+]?\d+)\.\.([-+]?\d+)(?:\.\.([-+]?\d+))?$/.exec(inside);
+  const letters = /^([A-Za-z])\.\.([A-Za-z])(?:\.\.([-+]?\d+))?$/.exec(inside);
+  const found = numbers ?? letters;
+  if (found === null) return null;
+  const [, first = "", last = "", by = "1"] = found;
+  const step = Math.abs(Number(by)) || 1;
+  const from = numbers ? Number(first) : first.charCodeAt(0);
+  const to = numbers ? Number(last) : last.charCodeAt(0);
+  const padded = numbers && [first, last].some((end) => /^[-+]?0\d/.test(end));
+  const width = Math.max(first.replace(/^\+/, "").length, last.replace(/^\+/, "").length);
+  const items = [];
+  for (let at = from; (from <= to ? at <= to : at >= to) && items.length <= 64; at += from <= to ? step : -step) {
+    tick();
+    if (!numbers) items.push(String.fromCharCode(at));
+    else if (!padded) items.push(String(at));
+    else items.push(`${at < 0 ? "-" : ""}${String(Math.abs(at)).padStart(width - (at < 0 ? 1 : 0), "0")}`);
+  }
+  return items;
+};
+
 // One path segment's glob as a test for a name: `*` and `{a..z}` any run, `?` and `[…]` one character; any case.
+const GLOB_PART = /\{[^{}/]*\.\.[^{}/]*\}|\[[^\]/]+\]|[*?]|[\s\S]/g;
 const globSegment = (segment) => {
-  const parts = [...segment.matchAll(/\{[^{}/]*\.\.[^{}/]*\}|\[[^\]/]+\]|[*?]|[\s\S]/g)].map(([part]) => {
+  const parts = [...segment.matchAll(GLOB_PART)].map(([part]) => {
     if (part === "*" || (part.length > 1 && part.startsWith("{"))) return ".*";
     if (part === "?" || (part.startsWith("[") && part.length > 1)) return ".";
     return part.replace(/[.+^${}()|[\]\\]/g, "\\$&");
@@ -2373,7 +2475,8 @@ const couldBeGuardFile = (path, guard) => {
   const expanded = braceWords(path);
   if (expanded === null) return true;
   return expanded.some((each) => {
-    const word = normalize(each).replace(/\/+$/, "");
+    // Any version of the store folder as the one guard folder (`node_modules/.pnpm/{reins,x}@0.2.0`).
+    const word = storeKey(normalize(each).replace(/\/+$/, ""));
     if (!/[*?[]|\{[^{}]*\.\.[^{}]*\}/.test(word)) return guard.match.test(word) || holdsGuardFile(word, guard);
     const raw = word.split("/").filter((segment) => segment !== "");
     const segments = raw.map(globSegment);
@@ -2384,7 +2487,9 @@ const couldBeGuardFile = (path, guard) => {
     return guard.files.some((file) => {
       const parts = file.split("/");
       if (loose && parts.length === 1) return false;
-      const fits = (from) => parts.every((part, index) => from + index >= segments.length || (segments[from + index]?.test(part) ?? false));
+      // A store folder's last part is a prefix (`reins@`), which a glob of any version can name.
+      const fit = (at, index) => (STORE_GUARDS.has(file) && index === parts.length - 1 ? globCouldStart(raw[at] ?? "", parts[index] ?? "") : (segments[at]?.test(parts[index] ?? "") ?? false));
+      const fits = (from) => parts.every((part, index) => from + index >= segments.length || fit(from + index, index));
       const ends = (from) => from + parts.length === segments.length || (from + parts.length < segments.length ? guard.dirs.has(file) : rooted);
       if (rooted) return segments.length > 0 && fits(0) && ends(0);
       for (let from = 0; from + parts.length <= segments.length; from += 1) if (fits(from) && ends(from)) return true;
@@ -2412,11 +2517,19 @@ const guardWrites = (headWords, dir, guard) => {
   return ask("This command writes, moves, or deletes one of the guard's own files (its config, its rule files, its installed package, or the hook config in .claude/settings.json or .cursor/hooks.json): a change to the guard is the user's call, in a reviewed PR.");
 };
 
-// True when `find <args>` deletes (`-delete`) what could be a guard file: a starting point that is
-// one of the guard's files or a folder holding one (`.claude`, `node_modules`), or a -name or -path
-// filter that could name one; with no filter, the project root too (`.`, or no starting point).
+// True when `find <args>` deletes (`-delete`), or runs a program that writes, moves, or deletes the
+// files it finds (`-exec rm -rf {} +`, -execdir, -ok, -okdir; a shell, whose script the guard doesn't
+// read here), on what could be a guard file: a starting point that is one of the guard's files or a
+// folder holding one (`.claude`, `node_modules`), or a -name or -path filter that could name one;
+// with no filter, the project root too (`.`, or no starting point).
 const findDeletes = (args, dir, guard) => {
-  if (!args.includes("-delete")) return false;
+  const execWrites = (word, at) => {
+    if (!/^-(exec|execdir|ok|okdir)$/.test(word)) return false;
+    const line = args.slice(at + 1);
+    const name = programName(line[programStart(line)] ?? "");
+    return REMOVERS.test(name) || FIND_WRITERS.test(name) || SHELL.test(name);
+  };
+  if (!args.includes("-delete") && !args.some(execWrites)) return false;
   const first = args.findIndex((word) => /^[-(!]/.test(word));
   const roots = (first === -1 ? args : args.slice(0, first)).map((root) => storeKey(fileKey(dir, root).replace(/\/+$/, "")));
   const filters = args.flatMap((word, at) => (/^-i?(name|path|wholename)$/.test(word) ? [normalize(args[at + 1] ?? "").replace(/\/+$/, "")] : []));
@@ -3404,7 +3517,9 @@ const pastOptions = (list, k, { short = "", long = [] } = {}) => {
 };
 
 // A command string made of some list, as the wrapper joins them; none when there are no list.
-const commandString = (list) => (list.length === 0 ? [] : [{ line: list.map((word) => word.value).join(" ") }]);
+// `built` is true when this shell filled some of the string in before the wrapper got it (`"$(…)"`,
+// `"$X"`): the text the wrapper runs is then not the text the guard reads (builtLines()).
+const commandString = (list) => (list.length === 0 ? [] : [{ line: list.map((word) => word.value).join(" "), built: list.some((word) => word.dynamic && /[$`]/.test(word.value)) }]);
 
 // A shell's arguments: `-c` (fish: `--command`, `-C`) takes a command string; no script, `-s`,
 // `-`, or /dev/stdin reads stdin; `<(X)` runs what X prints; any other script file is opaque.
