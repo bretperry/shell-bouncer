@@ -2,11 +2,11 @@
 // In the app: nothing at runtime; a coding agent's pre-command hook (Claude Code PreToolUse on Bash, Cursor beforeShellExecution) runs it before every agent command, through bin/reins.mjs.
 // Used by: bin/reins.mjs (`reins hook`, `reins explain`, `reins sets`), and any caller that imports the package; tested by test/*.test.mjs.
 // Uses: git (the branch where each commit or push runs); .env, package.json, Prisma config, and SQL files a database command reads; the rule sets named (sets/*.json, each must load); the project's reins.json, its rule folder, and its branch file when present (`files`).
-// Run: `reins hook claude` or `reins hook cursor`, from the agent's hook; a hook payload on stdin.
+// Run: `reins hook claude` or `reins hook cursor`, from the agent's hook; a hook payload on stdin. The old entry, `node <this file> claude|cursor`, runs the same hook.
 // When: before every agent shell command runs; not for a person's own shell, and not a substitute for the rules it enforces.
 // Env: REINS or WHIPPLETREE_GUARD (`off`: no verdict, so the command runs as it would with no guard; `offEnv` replaces the names); CLAUDE_PROJECT_DIR or CURSOR_PROJECT_DIR (the project root, when the caller names none); a database URL variable a command names, read from this process's environment, then the repo's .env.
 // Writes: nothing (read-only): `git rev-parse --abbrev-ref HEAD` (and `--git-common-dir` for a push) in the command's directory, and the rule and config files named in Uses, plus a freeze marker a set names; the verdict JSON on stdout.
-// Exit: 0 always; the verdict is JSON on stdout (deny, ask, or none, which Claude reads as no opinion); a crash or the 3 s watchdog answers ask.
+// Exit: 0 answered; the verdict is JSON on stdout (deny, ask, or none, which Claude reads as no opinion); a crash or the 3 s watchdog answers ask. Run as a script (the old entry): 2 blocked, as `reins hook` blocks.
 //
 // Written rules say what an agent never does; this makes the worst of them a refusal instead of a
 // memory test. "deny" is for acts no session may take (flipping a ready PR back to draft,
@@ -38,12 +38,15 @@
 // - deny, any line: a rule file that is present but doesn't load.
 // - ask: `gh pr ready`, `gh pr merge` (and its GraphQL/API forms);
 //   pushing or moving main or master (`askOnPush`); `gh workflow run` or a dispatch; changing branch protection or
-//   a ruleset; setting core.hooksPath or a key a set names; a git alias; a forced push from a branch it can't read.
+//   a ruleset; setting core.hooksPath or a key a set names; a git or gh alias; git config from GIT_CONFIG_* variables;
+//   `git send-pack` or `http-push` (a push without the pre-push hook);
+//   a forced push from a branch it can't read; a git or gh subcommand, a program in front of `push`/`merge`, or a
+//   forced or deleting push's ref that the shell fills in (a variable the line set, or braces, is read); what `find -exec` runs.
 // - ask, data: destructive SQL, a migration, or a store delete where it can't tell the target; SQL it
 //   can't read or built at run time (DO, EXECUTE, \gexec) against a non-loopback database; destructive
 //   SQL in a container; removing Docker volumes; `terraform test`, `cdk bootstrap|import`.
 // - ask, the guard itself: writing, moving, or deleting a guard file (its config, its rule files, its
-//   installed package, the hook config); changing the guard's own package with a package manager;
+//   installed package, bin, and store folders, the hook config; `find -delete` and editors too); changing the guard's own package with a package manager;
 //   a line it can't read in time, in size, or in depth.
 //
 // One shell parser, parseLine(), reads the line as a shell would (quotes and heredoc bodies stay
@@ -69,9 +72,9 @@
 
 // Node builtins only, so the hook runs before `pnpm install`.
 import { execFileSync } from "node:child_process";
-import { lstatSync, opendirSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
+import { lstatSync, opendirSync, readdirSync, readFileSync, realpathSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 
@@ -1385,7 +1388,7 @@ const evaluateLine = (command, options) => {
     const text = commandText(list);
     if (/^(cd|pushd|popd)(\s|$)/.test(text)) moved = true;
     const before = previous;
-    previous = { list, expands, heredocs: parsed.heredocs, head };
+    previous = { list, expands, heredocs: parsed.heredocs, herestrings: parsed.herestrings, stdinProcs: parsed.stdinProcs, head };
     // What this command writes, for a later `psql -f` on the line.
     for (const path of writes(list)) written.add(fileKey(dir, path));
     // `VAR=value` words in front of this command, as the shell will set them for it.
@@ -1459,6 +1462,13 @@ const evaluateLine = (command, options) => {
     }
     // `source f` / `. f`, `set -a`, `read X < f` and friends can set any variable to anything.
     if (/^(source|\.)\s/.test(text) || /^(read|mapfile|readarray|declare|typeset|local)\b/.test(text) || /^set\s+(-\w*a\b|-o\s+allexport\b)/.test(text)) {
+      // `source <(echo '…')` runs what the command in `<(…)` prints, here.
+      for (const target of runs(parsed.words)) {
+        for (const line of target.printed === undefined ? [] : printedLines(target.printed)) {
+          const inner = line === FED_TOO_LONG ? ask(FED_TOO_LONG_ASK) : nested(line, inline);
+          if (inner) verdicts.push(inner);
+        }
+      }
       loseTrack();
       continue;
     }
@@ -1468,16 +1478,32 @@ const evaluateLine = (command, options) => {
     const targets = runs(parsed.words);
     const followed = new Set();
     const follow = (line, extra) => {
+      // A long script `cat` or `<(…)` prints into a shell asks rather than being read (printedBy()).
+      if (line === FED_TOO_LONG) {
+        verdicts.push(ask(FED_TOO_LONG_ASK));
+        return;
+      }
       if (followed.has(line)) return;
       followed.add(line);
       const inner = nested(line, inline, extra);
       if (inner) verdicts.push(inner);
     };
     for (const target of targets) {
+      // `bash <(echo '…')`, `source <(cat <<EOF …)`: the shell runs what the command in `<(…)` prints.
+      if (target.printed !== undefined) for (const line of printedLines(target.printed)) follow(line, {});
       if (target.line === undefined && target.stdin !== true) continue;
       if (target.via === "eval") loseTrack();
       const extra = SHELL.test(target.via ?? "") ? {} : (LINE_FLAGS[target.via ?? ""] ?? { lost: true, wrapped: true });
       for (const line of target.line === undefined ? fedLines(parsed, before) : [target.line]) follow(line, extra);
+    }
+    // `find … -exec X {} \;` (and -execdir, -ok, -okdir) runs X once per file, a wrapper the guard
+    // reads only in outline (as judge()'s fallback reads others): a verdict on X asks.
+    for (const target of targets) {
+      if (target.argv === undefined || programName(target.argv[0]?.value ?? "") !== "find") continue;
+      for (const line of findExecs(target.argv)) {
+        const inner = nested(line, inline, { lost: true, wrapped: true });
+        if (inner) verdicts.push(ask(`\`find -exec\` runs \`${line}\` for each file it finds, and the guard would stop that command on its own (${inner.reason}); the user confirms.`));
+      }
     }
     // `ssh h psql …`, `kubectl exec p -- psql …`, `watch psql …`: a line run behind a wrapper the
     // guard doesn't model, judged on its own with every variable unseen.
@@ -1543,18 +1569,35 @@ const evaluateLine = (command, options) => {
     // config, and gh api rules. `git -C X …` runs in X for that program only (each `-C` from the one
     // before); `--git-dir` or `--work-tree` points it at a repository whose branch isn't looked up.
     // The push rule asks for the branch only when it needs it, so plain commands look nothing up.
-    const programs = targets.filter((target) => target.argv !== undefined).map((target) => target.argv.map((word) => word.value));
-    for (const program of programs) {
+    const programWords = targets.flatMap((target) => (target.argv === undefined ? [] : [target.argv]));
+    const programs = programWords.map((words) => words.map((word) => word.value));
+    // GIT_CONFIG_COUNT / GIT_CONFIG_KEY_<n> / GIT_CONFIG_PARAMETERS set git config (an alias,
+    // core.hooksPath) for the git they reach, which the guard doesn't read: in front of the program,
+    // after `env`, or exported earlier on the line.
+    const gitEnv = list.some((word) => GIT_CONFIG_ENV.test(assigned(word) ?? "")) || [...lineEnv.keys()].some((name) => GIT_CONFIG_ENV.test(name) && lineEnv.get(name) !== UNSET);
+    for (const [index, program] of programs.entries()) {
       const argv = programArgv(program);
       const git = argv[0] === "git" ? gitGlobals(argv) : null;
       const at = (git?.dirs ?? []).reduce((from, target) => (isAbsolute(target) ? target : join(from ?? "", target)), dir);
       const gitBranch = () => (git?.elsewhere === true ? "" : branchAt(at));
       if (skipping !== undefined && git !== null && argv[git.sub] === "push") found.push(skipDeny());
       if (/^git\b.*\bcommit\b/.test(argv.join(" "))) commitBranches.push(gitBranch());
-      found.push(...policyVerdicts(argv.join(" "), sets.program), evaluatePush(argv, gitBranch, branches, (file) => (git?.elsewhere === true ? null : freezeAt(at, file)), sets.freezeMarkers), evaluateGitConfig(argv, sets.gitConfigAsk), evaluateGhApi(argv, segment, branches, sets), evaluateGhVariable(argv, sets.repoVariables));
-      // The program again with this line's variables filled in, for the text rules and `gh api`'s.
-      const filledArgv = argv.map(fill);
-      if (filledArgv.some((word, index) => word !== argv[index])) found.push(...policyVerdicts(filledArgv.join(" "), sets.program), evaluateGhApi(filledArgv, fill(segment), branches, sets), evaluateGhVariable(filledArgv, sets.repoVariables));
+      const pushVerdict = (each) => evaluatePush(each, gitBranch, branches, (file) => (git?.elsewhere === true ? null : freezeAt(at, file)), sets.freezeMarkers);
+      found.push(...policyVerdicts(argv.join(" "), sets.program), pushVerdict(argv), evaluateGitConfig(argv, sets.gitConfigAsk), evaluateGhApi(argv, segment, branches, sets), evaluateGhVariable(argv, sets.repoVariables));
+      // The program again with this line's variables filled in (`G=git; $G push …`), for the text,
+      // push, git config, and `gh api` rules.
+      const filledArgv = programArgv(program.map(fill));
+      if (filledArgv.some((word, at) => word !== argv[at])) found.push(...policyVerdicts(filledArgv.join(" "), sets.program), pushVerdict(filledArgv), evaluateGitConfig(filledArgv, sets.gitConfigAsk), evaluateGhApi(filledArgv, fill(segment), branches, sets), evaluateGhVariable(filledArgv, sets.repoVariables));
+      // The program again as the shell expands its braces (`git push -f origin ma{in,x}`, `{git,push} …`);
+      // braceWords() lists a word's expansions last first.
+      const words = programWords[index] ?? [];
+      if (words.some((word) => word.brace)) {
+        const braced = programArgv(words.flatMap((word) => (word.brace ? (braceWords(word.value)?.reverse() ?? [word.value]) : [word.value])));
+        found.push(...policyVerdicts(braced.join(" "), sets.program), pushVerdict(braced), evaluateGitConfig(braced, sets.gitConfigAsk));
+      }
+      // What the shell fills in where the git and gh rules read a word by name (unreadGit()).
+      found.push(unreadGit(words, fill, branches, pushVerdict));
+      if (gitEnv && argv[0] === "git") found.push(ask(GIT_CONFIG_ENV_ASK));
     }
     // Rule-set rows read as a pack's are, then pack and project rules, when there are any: `match`
     // reads the program text (prefixes removed, heredoc words after it) and each program run behind a
@@ -1616,13 +1659,91 @@ const evaluateLine = (command, options) => {
 // other wrapper's (a loader's `--command`, `npx -c`) also hides its variables.
 const LINE_FLAGS = { eval: { wrapped: true }, env: { wrapped: true }, ssh: { lost: true, wrapped: true, remote: true } };
 
-// What a shell reading stdin runs: the heredocs and here-strings fed to it, or what an `echo` or
-// `printf` before it pipes in (`echo 'git push …' | sh`).
+// What a shell reading stdin runs: the heredocs and here-strings fed to it, what a `< <(…)` prints
+// into it, or what the command before it pipes in (`echo 'git push …' | sh`, `cat <<EOF | sh`).
 const fedLines = (parsed, before) => {
-  const fed = [...parsed.heredocs.map((doc) => doc.body), ...parsed.herestrings.map((word) => word.value)];
-  const printer = before === null ? "" : programName(before.list[programStart(before.list)] ?? "");
-  if (parsed.piped && /^(echo|printf)$/.test(printer)) fed.push(before.list.slice(programStart(before.list) + 1).filter((word) => !/^-[neE]+$/.test(word)).join(" "));
+  const fed = [...parsed.heredocs.map((doc) => doc.body), ...parsed.herestrings.map((word) => word.value), ...parsed.stdinProcs.flatMap(printedLines)];
+  if (parsed.piped && before !== null) fed.push(...printedBy(before.list, before.heredocs, before.herestrings ?? []));
   return fed;
+};
+
+// What one command prints, as far as the guard reads it: an `echo` or `printf`'s words, or the
+// heredocs and here-strings `cat` copies out. Anything else prints what the guard can't see. A
+// `cat` text past MAX_FED_CHARS is FED_TOO_LONG, which asks: reading it as a script costs more
+// than the time budget allows (a 200k-character body takes seconds).
+const printedBy = (list, heredocs, herestrings) => {
+  const start = programStart(list);
+  const printer = programName(list[start] ?? "");
+  if (/^(echo|printf)$/.test(printer)) return [list.slice(start + 1).filter((word) => !/^-[neE]+$/.test(word)).join(" ")];
+  if (printer === "cat") return [...heredocs.map((doc) => doc.body), ...herestrings.map((word) => word.value)].map((text) => (text.length > MAX_FED_CHARS ? FED_TOO_LONG : text));
+  return [];
+};
+const MAX_FED_CHARS = 16 * 1024;
+// Not a line the parser can produce, so it can't be confused with one.
+const FED_TOO_LONG = "\0fed-too-long";
+const FED_TOO_LONG_ASK = `A shell here runs a script over ${MAX_FED_CHARS / 1024} KB that \`cat\` or \`<(…)\` prints, longer than the guard reads; the user confirms what it runs.`;
+
+// What the commands in a `<(…)` print, for a shell that runs it (`bash <(…)`, `source <(…)`).
+const printedLines = (text) => parseLine(text).commands.flatMap((command) => printedBy(command.tokens, command.heredocs, command.herestrings));
+
+// The command lines `find … -exec X … ;` runs (also -execdir, -ok, -okdir; `{} +` ends one too),
+// quoted back into lines.
+const findExecs = (words) => {
+  const lines = [];
+  for (let at = 1; at < words.length; at += 1) {
+    if (!/^-(exec|execdir|ok|okdir)$/.test(words[at]?.value ?? "")) continue;
+    let end = at + 1;
+    while (end < words.length && words[end]?.value !== ";" && !(words[end]?.value === "+" && words[end - 1]?.value === "{}")) end += 1;
+    if (end > at + 1) lines.push(words.slice(at + 1, end).map((word) => shellQuote(word.value)).join(" "));
+    at = end;
+  }
+  return lines;
+};
+
+// GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>, GIT_CONFIG_PARAMETERS: git config set from the environment.
+const GIT_CONFIG_ENV = /^GIT_CONFIG_(COUNT|PARAMETERS|KEY_\w+|VALUE_\w+)$/;
+const GIT_CONFIG_ENV_ASK = "GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, or GIT_CONFIG_PARAMETERS sets git config for this git (an alias, core.hooksPath), which the guard doesn't read; the user confirms what it runs.";
+// A substitution that prints the branch a command runs on.
+const CURRENT_BRANCH = /^\$\(\s*git\s+(branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+--short\s+(-q\s+)?HEAD)\s*\)$/;
+const UNREAD_GIT_ASK = "The git or gh command here, or the branch a forced or deleting push writes, comes from a variable or a substitution the guard can't read; the user confirms what it runs.";
+
+// Asks when the shell fills in, at run time, a word the git and gh rules read by name: the program
+// (`$G push …`, `$(which git) push …`), git's subcommand (`git $(echo push) …`), gh's (`gh $X merge`,
+// `gh pr $(echo merge)`), or a ref of a push that would be refused if it named a protected branch
+// (`git push -f origin "$(echo main)"`, `${B:-main}`). `words` is one program's parsed words;
+// `fill` fills in the variables this line set (a word it fills is read by the rules already);
+// `pushVerdict` judges a push's argv as evaluatePush() does.
+const unreadGit = (words, fill, branches, pushVerdict) => {
+  const unread = (word) => word !== undefined && word.dynamic && (/[$`]/.test(fill(word.value)) || word.proc != null);
+  const values = words.map((word) => word.value);
+  const argv = programArgv(values);
+  if (unread(words[0]) && values.slice(1).some((value) => /^(push|merge)$/.test(value))) return ask(UNREAD_GIT_ASK);
+  if (argv[0] === "gh") {
+    let at = 1;
+    while (at < values.length && (GH_REPO_FLAG.test(values[at] ?? "") || GH_REPO_GLUED.test(values[at] ?? ""))) at += GH_REPO_FLAG.test(values[at] ?? "") ? 2 : 1;
+    return unread(words[at]) || (values[at] === "pr" && unread(words[at + 1])) ? ask(UNREAD_GIT_ASK) : null;
+  }
+  if (argv[0] !== "git") return null;
+  const { sub } = gitGlobals(argv);
+  if (unread(words[sub])) return ask(UNREAD_GIT_ASK);
+  if (argv[sub] !== "push") return null;
+  // `"$(git branch --show-current)"` is the branch it runs on, which the push rule reads as HEAD.
+  const base = argv.map((value, at) => (at > sub && CURRENT_BRANCH.test(value) ? "HEAD" : value));
+  const spots = words.flatMap((word, at) => (at > sub && !CURRENT_BRANCH.test(word.value) && !word.value.startsWith("-") && unread(word) ? [at] : []));
+  if (spots.length === 0) return base.some((value, at) => value !== argv[at]) ? pushVerdict(base) : null;
+  // Each unread word read as each protected branch: a refusal there is one the guard can't rule out.
+  // A `src:dst` keeps a dst it can read; a `+` in front still forces.
+  const asRef = (value, name) => {
+    // The `:` between src and dst, outside `${…}`, `$(…)`, and backticks (`${B:-main}` has none).
+    const masked = value.replace(/\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`/g, (part) => "$".padEnd(part.length, "_"));
+    const colon = masked.lastIndexOf(":");
+    if (colon !== -1) return /[$`]/.test(masked.slice(colon + 1)) ? `${value.slice(0, colon + 1)}${name}` : value;
+    return `${value.startsWith("+") ? "+" : ""}${name}`;
+  };
+  for (const name of branches.protected) {
+    if (pushVerdict(base.map((value, at) => (spots.includes(at) ? asRef(value, name) : value)))?.decision === "deny") return ask(UNREAD_GIT_ASK);
+  }
+  return null;
 };
 
 // Each act's reason, shared by its gh subcommand and the API road to the same act. The gh
@@ -1661,6 +1782,9 @@ const POLICY = [
   // Merging is allowed with the user's OK for this batch, so the user decides here; the REST API's
   // road to the same act is read by evaluateGhApi().
   { match: /^gh\s+pr\s+merge\b/, verdict: "ask", reason: MERGE_ASK },
+  // A gh alias runs whatever it is defined as (`gh alias set m 'pr merge'`, then `gh m 1`), while the
+  // guard reads only the alias's name; git's aliases ask the same way (evaluateGitConfig()).
+  { match: /^gh\s+alias\s+(set|import)\b/, verdict: "ask", reason: "A gh alias runs whatever it is defined as, and the guard reads only the alias's name later; the user confirms what it runs." },
   // Several agents share one machine: a kill by pattern or by program name takes their runs down too.
   { match: /^pkill\b(?:.*\s)?(?:-\w*f\w*|--full)(?=\s|$)/, verdict: "deny", reason: PATTERN_KILL_DENY },
   { match: /^(?:pkill|killall)\b(?:.*\s)?(?:node|chrome|chromium|google\s+chrome)(?=\s|$)/i, verdict: "deny", reason: PATTERN_KILL_DENY },
@@ -1739,6 +1863,8 @@ const evaluatePush = (/** @type {string[]} */ argv, /** @type {() => string} */ 
   // Require `git`, skip its global options (-C dir, -c key=value, --git-dir …), and require `push`.
   if (argv[0] !== "git") return null;
   const { sub, config } = gitGlobals(argv);
+  // git's plumbing pushes (`send-pack`, `http-push`) write the remote's refs without the pre-push hook.
+  if (argv[sub] === "send-pack" || argv[sub] === "http-push") return ask(`\`git ${argv[sub]}\` pushes refs without the pre-push hook, and the guard doesn't read its refs; the user confirms what it writes.`);
   if (argv[sub] !== "push") return null;
   // `-c core.hooksPath=…` points git at another hooks folder for this push: the pre-push guard doesn't run.
   if (config.some((setting) => settingName(setting) === "core.hookspath")) {
@@ -2145,7 +2271,28 @@ const markerWrites = (list, markerFiles = []) => {
 // package; a rule set's `guardFiles` adds its own. A path ending in `/` is a folder: a path inside
 // it is a guard file too. compileGuard() builds the matcher: one by its path's end, so an absolute
 // path counts too, and in any case (a Mac's file system folds it).
-const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`];
+// The installed package is more than `node_modules/<pkg>/`: the command its hook runs
+// (`node_modules/.bin/<bin>`, a symlink or a shim script, `.cmd` and `.ps1` on Windows), and the
+// package managers' stores, where the files really live (STORES).
+const BIN_NAME = PACKAGE_NAME.replace(/^@[^/]+\//, "");
+const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`, ...["", ".cmd", ".ps1"].map((ext) => `node_modules/.bin/${BIN_NAME}${ext}`)];
+
+// The stores that hold the installed package in a folder named for its version: pnpm's
+// `node_modules/.pnpm/<pkg>@<version>/`, bun's `node_modules/.bun/<pkg>@<version>/` (a scope's `/`
+// is `+` there), and Yarn's `.yarn/cache/<pkg>-npm-<version>-<hash>.zip` and `.yarn/unplugged/` (`-`
+// for the `/`). storeKey() reads any version as the one guard folder listed here, so a write or
+// delete inside it, of it (`rm -rf node_modules/.pnpm/<pkg>@*`), or of a folder holding it
+// (`rm -rf node_modules/.pnpm`) asks, and another package's store folder doesn't.
+const STORES = [
+  { dir: "node_modules/.pnpm", name: `${PACKAGE_NAME.replace("/", "+")}@` },
+  { dir: "node_modules/.bun", name: `${PACKAGE_NAME.replace("/", "+")}@` },
+  { dir: ".yarn/cache", name: `${PACKAGE_NAME.replace("/", "-")}-npm-` },
+  { dir: ".yarn/unplugged", name: `${PACKAGE_NAME.replace("/", "-")}-npm-` },
+];
+const STORE_FILES = STORES.map((store) => `${store.dir}/${store.name}/`);
+const STORE_KEY = new RegExp(`(^|/)(${STORES.map((store) => `${store.dir}/${store.name}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[^/]*`, "gi");
+// A path with any version of the package's store folder read as the one guard folder (STORES).
+const storeKey = (path) => path.replace(STORE_KEY, (_, lead, folder) => `${lead}${folder}`);
 
 // The matcher for a list of guard paths (folders end in `/`): `files` (lowercased, no trailing `/`),
 // `dirs` (the folders among them), and `match` (a path that is one, or inside a folder that is one).
@@ -2161,7 +2308,7 @@ const compileGuard = (paths) => {
 // The core's guard files with nothing configured: the default config file and the hook configs.
 let defaultGuardFiles = null;
 const defaultGuard = () => {
-  defaultGuardFiles ??= compileGuard([DEFAULT_FILES.config, ...HOOK_FILES]);
+  defaultGuardFiles ??= compileGuard([DEFAULT_FILES.config, ...HOOK_FILES, ...STORE_FILES]);
   return defaultGuardFiles;
 };
 
@@ -2247,8 +2394,9 @@ const couldBeGuardFile = (path, guard) => {
 };
 
 // An ask when this command writes, moves, or deletes one of the guard's files, or a folder that holds
-// one (`rm -rf .claude`); `dir` is where it runs (null for the hook's cwd). Still unread: a write
-// from inside an interpreter (`node -e`, `python3 -c`), `find -delete`, and an archive's `-C`/`-d`.
+// one (`rm -rf .claude`); `dir` is where it runs (null for the hook's cwd). Also `find X -delete`
+// (findDeletes()). Still unread: a write from inside an interpreter (`node -e`, `python3 -c`), and
+// what an archive, a patch, or a sync writes (`tar x`, `unzip`, `git apply`, `rsync`).
 const guardWrites = (headWords, dir, guard) => {
   const start = programStart(headWords);
   const program = programName(headWords[start] ?? "");
@@ -2259,9 +2407,22 @@ const guardWrites = (headWords, dir, guard) => {
   const gitArgs = git === null ? [] : headWords.slice(start + git.sub).filter((word) => !word.startsWith("-"));
   const gitDir = (git?.dirs ?? []).reduce((from, target) => (isAbsolute(target) ? target : join(from ?? "", target)), dir);
   const gitWrites = /^(rm|mv|checkout|restore)$/.test(gitArgs[0] ?? "") ? gitArgs.slice(1).map((path) => fileKey(gitDir, path)) : [];
-  const paths = [...[...writes(headWords), ...(REMOVERS.test(program) ? operands : [])].map((path) => fileKey(dir, path)), ...gitWrites].map((path) => path.replace(/\/+$/, ""));
-  if (!paths.some((path) => guard.match.test(path) || holdsGuardFile(path, guard) || couldBeGuardFile(path, guard))) return null;
+  const paths = [...[...writes(headWords), ...(REMOVERS.test(program) ? operands : [])].map((path) => fileKey(dir, path)), ...gitWrites].map((path) => storeKey(path.replace(/\/+$/, "")));
+  if (!paths.some((path) => guard.match.test(path) || holdsGuardFile(path, guard) || couldBeGuardFile(path, guard)) && !(program === "find" && findDeletes(headWords.slice(start + 1), dir, guard))) return null;
   return ask("This command writes, moves, or deletes one of the guard's own files (its config, its rule files, its installed package, or the hook config in .claude/settings.json or .cursor/hooks.json): a change to the guard is the user's call, in a reviewed PR.");
+};
+
+// True when `find <args>` deletes (`-delete`) what could be a guard file: a starting point that is
+// one of the guard's files or a folder holding one (`.claude`, `node_modules`), or a -name or -path
+// filter that could name one; with no filter, the project root too (`.`, or no starting point).
+const findDeletes = (args, dir, guard) => {
+  if (!args.includes("-delete")) return false;
+  const first = args.findIndex((word) => /^[-(!]/.test(word));
+  const roots = (first === -1 ? args : args.slice(0, first)).map((root) => storeKey(fileKey(dir, root).replace(/\/+$/, "")));
+  const filters = args.flatMap((word, at) => (/^-i?(name|path|wholename)$/.test(word) ? [normalize(args[at + 1] ?? "").replace(/\/+$/, "")] : []));
+  if (roots.some((root) => guard.match.test(root) || holdsGuardFile(root, guard))) return true;
+  if (filters.length > 0) return filters.some((filter) => couldBeGuardFile(filter, guard));
+  return roots.length === 0 || roots.includes(".");
 };
 
 // "loopback" when every host is this machine, "remote" when any isn't, "unknown" when there are none.
@@ -2493,6 +2654,8 @@ const writes = (list) => {
   // concat, not push(...): a line with a million operands would overflow the call stack.
   const more = [
     program === "tee" || ((program === "sed" || program === "perl") && args.some((word) => /^-[A-Za-z]*i/.test(word))) ? operands : [],
+    // An editor run from a command writes the files it opens (`ex -sc '%d|x' f`, `ed f <<<…`, `vim -es`).
+    /^(ex|ed|vi|vim|nvim)$/.test(program) ? operands : [],
     program === "curl" || program === "wget" ? flagValues(args, ["-o", "--output", "-O", "--output-document"]) : [],
     args.filter((word) => word.startsWith("of=")).map((word) => word.slice(3)),
   ];
@@ -4110,13 +4273,23 @@ const parseConfig = (text) => {
     ruleDir: data["ruleDir"] === undefined ? null : relativePath(data["ruleDir"], "ruleDir"),
     protectedBranches: data["protectedBranches"] === undefined ? null : branchNames(data["protectedBranches"], "protectedBranches"),
     askOnPush: data["askOnPush"] === undefined ? null : branchList(data["askOnPush"], "askOnPush"),
-    askTags: data["askTags"] === undefined ? null : askTagsOf(data["askTags"]),
+    askTags: data["askTags"] === undefined ? null : configAskTags(data["askTags"]),
   };
+};
+
+// The config's askTags: as askTagsOf() reads them, with `log` a path inside the project (relative,
+// no `..`, no `~`), so a project's file can't have the gate append to a file elsewhere on the
+// machine. A caller's own askTags (the ask gate's `askTags` option) may name any path.
+const configAskTags = (value) => {
+  const settings = askTagsOf(value);
+  if (settings.log !== undefined) relativePath(settings.log, "askTags.log");
+  return settings;
 };
 
 // The ask gate's settings (askTags): `tags` (the reasons a question may reach the user), and
 // optional `refusal` (the text an untagged question gets), `tools` (the tool names it judges; all
-// when absent), `log` (a JSONL file each question is recorded in; `~/` is the home folder).
+// when absent), `log` (a JSONL file each question is recorded in; `~/` is the home folder; in
+// reins.json, only a path inside the project: configAskTags()).
 export const askTagsOf = (value) => {
   if (!isRecord(value)) throw new Error('"askTags" must be an object');
   onlyKeys(value, ["tags", "refusal", "tools", "log"], "askTags");
@@ -4140,20 +4313,20 @@ export const loadRules = (root, { files = {}, sets: names, offEnv = DEFAULT_OFF_
   try {
     const paths = filesOf(files);
     file = paths.config ?? "the config";
-    const configText = paths.config === null ? null : readRuleFile(join(root, paths.config));
+    const configText = paths.config === null ? null : readRuleFile(join(root, paths.config), root);
     const config = configText === null ? null : parseConfig(configText);
     const setNames = names ?? config?.sets ?? [];
     if (!Array.isArray(setNames)) throw new Error("the sets option must be an array");
     const sets = loadSets(setNames, off);
     if (sets.error !== "") return { ...NO_RULES, sets, loaded: [], askTags: null, error: sets.error };
     const ruleDir = config?.ruleDir ?? paths.ruleDir;
-    const guard = compileGuard([...[paths.config, paths.branches].filter((path) => path !== null), ...(ruleDir === null ? [] : [`${ruleDir}/`]), ...HOOK_FILES, ...sets.guardFiles]);
+    const guard = compileGuard([...[paths.config, paths.branches].filter((path) => path !== null), ...(ruleDir === null ? [] : [`${ruleDir}/`]), ...HOOK_FILES, ...STORE_FILES, ...sets.guardFiles]);
     let branches = sets.branches;
     if (config?.protectedBranches) branches = { ...branches, protected: new Set(config.protectedBranches) };
     if (config?.askOnPush) branches = { ...branches, askOnPush: new Set(config.askOnPush) };
     if (paths.branches !== null) {
       file = paths.branches;
-      const named = protectedBranches(readRuleFile(join(root, paths.branches)));
+      const named = protectedBranches(readRuleFile(join(root, paths.branches), root));
       if (named !== null && config?.protectedBranches) throw new Error(`"protectedBranches" is also set in ${paths.config}; name it in one file`);
       if (named !== null) branches = { ...branches, protected: new Set(named) };
     }
@@ -4163,7 +4336,7 @@ export const loadRules = (root, { files = {}, sets: names, offEnv = DEFAULT_OFF_
     for (const each of read) {
       file = each.name;
       const project = each.text !== null;
-      const text = each.text ?? readRuleFile(join(root, each.name));
+      const text = each.text ?? readRuleFile(join(root, each.name), root);
       // Absent: nothing to add.
       if (text === null) continue;
       const parsed = parseRules(text, { project, branches, sets, guard, extraKeys: project ? CONFIG_KEYS : [] });
@@ -4388,9 +4561,11 @@ const fileName = (value, at) => {
   return name;
 };
 
-// The pack rule files in `dir`, by name; none when the directory isn't there.
+// The pack rule files in `dir`, by name; none when the directory isn't there. A folder that is a
+// link out of the project throws (insideRoot()).
 const packFiles = (root, dir) => {
   try {
+    insideRoot(join(root, dir), root);
     return readdirSync(join(root, dir)).filter((name) => name.endsWith(".json")).toSorted().map((name) => `${dir}/${name}`);
   } catch (error) {
     if (isMissing(error, join(root, dir))) return [];
@@ -4401,14 +4576,30 @@ const packFiles = (root, dir) => {
 // A rule file's text, or null when nothing is at that path. A dangling symlink or an unreadable
 // file is not "absent": it throws, so the caller refuses everything. So is a FIFO or a device:
 // reading one blocks, and the watchdog can stop JavaScript but not a read blocked in the kernel.
-const readRuleFile = (path) => {
+// With `root` (a project's own file), a file that is really outside it throws too (insideRoot()).
+const readRuleFile = (path, root = null) => {
   try {
+    if (root !== null) insideRoot(path, root);
     if (!statSync(path).isFile()) throw new Error(`${path} is not a regular file`);
     return readFileSync(path, "utf8");
   } catch (error) {
     if (isMissing(error, path)) return null;
     throw error;
   }
+};
+
+// Throws when `path`, its links followed, lies outside the project `root` (its links followed too):
+// a config or rule file linked to one outside the project, which the project's review never sees,
+// is refused like a broken one. Nothing at `path` (or a dangling link) passes here; the read reports it.
+const insideRoot = (path, root) => {
+  let real = "";
+  try {
+    real = realpathSync(path);
+  } catch {
+    return;
+  }
+  const from = relative(realpathSync(root), real);
+  if (isAbsolute(from) || from.split(/[\\/]/)[0] === "..") throw new Error(`${relative(root, path)} is a link to a path outside the project`);
 };
 
 // True when `error` says nothing is at `path` and not even a link sits there.
@@ -4735,3 +4926,45 @@ export const respond = (verdict, host = "claude") => {
     );
   }
 };
+
+// True when Node was started on this file (the old hook entry, `node …/src/guard.mjs claude`). Real
+// paths on both sides: Node resolves symlinks for import.meta.url but not for argv[1], so a project
+// opened through a symlink would skip the guard silently.
+const isScript = () => {
+  try {
+    return process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+};
+
+// Run as a script, this file is the old hook entry, and it keeps enforcing after an upgrade: the same
+// hook `reins hook <host>` runs, with the same block for a guard that dies without answering (exit 2,
+// the reason on stderr, and a deny for Cursor). A test that imports this file reads no stdin.
+if (isScript()) {
+  const host = process.argv[2] ?? "claude";
+  const block = (why) => {
+    const message = `reins: ${why}, so this command is blocked. Tell the user: point the hook at \`reins hook claude|cursor\`, or set REINS=off in the shell that starts the agent.`;
+    try {
+      if (host === "cursor") writeSync(1, JSON.stringify({ permission: "deny", user_message: message, agent_message: message }));
+      writeSync(2, `${message}\n`);
+    } catch {
+      // The exit code still blocks.
+    }
+    process.exitCode = 2;
+  };
+  process.on("exit", (code) => {
+    if (code !== 0 && code !== 2 && !guardOff()) block(`the guard exited with code ${String(code)} without answering`);
+  });
+  if (host !== "claude" && host !== "cursor") {
+    block(`the hook named an unknown host ${JSON.stringify(host)} (claude or cursor)`);
+    process.exit(2);
+  }
+  try {
+    main({ host });
+  } catch (error) {
+    if (guardOff()) process.exit(0);
+    block(`the guard failed before answering (${error instanceof Error ? error.message : String(error)})`);
+    process.exit(2);
+  }
+}

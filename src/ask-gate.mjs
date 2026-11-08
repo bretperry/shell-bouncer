@@ -76,7 +76,8 @@ const appendRecord = (log, cwd, entry) => {
 // The hook entry: reads the payload on stdin (or `input`), judges it, and returns the exit code
 // (0 or 2) for the caller to exit with. `askTags` ({ tags, refusal, tools, log }) replaces the
 // config's; else they come from the config at `root` (`files` renames it). A relative `log` is
-// read from the project root.
+// read from the project root; the config's must be one (loadRules() refuses any other), while a
+// caller's `askTags.log` may also be absolute or start `~/`.
 export const run = ({ root, files = {}, askTags, offEnv = DEFAULT_OFF_ENV, input } = {}) => {
   let payload = null;
   try {

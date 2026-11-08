@@ -3616,3 +3616,96 @@ describe("guard: a package runner's command-string options", () => {
     for (const command of ["pnpm exec -c 'echo hi'", "pnpm -c exec 'echo hi'", "npm exec --call='echo hi'", "npm exec --call 'git push origin feat'"]) assert.equal(verdictOf(command), null, command);
   });
 });
+
+// Words the shell fills in where the git and gh rules read by name: braces are expanded and read; a
+// variable this line set is filled in; anything else the guard can't read asks where it would decide
+// a forced or deleting push, git's or gh's subcommand, or the program.
+describe("guard: shell-filled git and gh words", () => {
+  const rows = [
+    ["git push -f origin ma{in,x}", "deny"],
+    ["git push -f origin {feat,main}", "deny"],
+    ["{git,push} -f origin main", "deny"],
+    ["git push origin {a,b}", null],
+    ["G=git; $G push -f origin main", "deny"],
+    ["B=main; git push -f origin $B", "deny"],
+    ["B=feat; git push -f origin $B", null],
+    ["git $(echo push) -f origin main", "ask"],
+    ["$(which git) push origin feat", "ask"],
+    ["$G push origin feat", "ask"],
+    ["git push -f origin $(echo main)", "ask"],
+    ["git push -f origin ${B:-main}", "ask"],
+    ["git push -f origin $B", "ask"],
+    ["git push -f origin +$B", "ask"],
+    ["git push origin :$B", "ask"],
+    ["git push -f origin feat:$B", "ask"],
+    ["gh $X merge 1", "ask"],
+    ["gh pr $(echo merge) 1", "ask"],
+    // Controls: a plain push, a read ref, and gh words past the subcommand stay as they were.
+    ["git push origin $B", "ask"], // the team set's workflow-only branch could be $B; core-only: test/standalone.test.mjs
+    ["git push -f origin $B:feat", null],
+    ["git push -f $R", null],
+    ['git push -f origin "$(git branch --show-current)"', null],
+    ["git push --force-with-lease -u origin $(git rev-parse --abbrev-ref HEAD)", null],
+    ["gh pr view $N", null],
+    ["gh api repos/$O/r/pulls", null],
+    ["$EDITOR notes.txt", null],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+  it("a current-branch substitution reads as the branch the push runs on", () => {
+    assert.equal(evaluate('git push -f origin "$(git branch --show-current)"', { branch: "main" })?.decision, "deny");
+  });
+});
+
+describe("guard: git config from the environment, gh aliases, and plumbing pushes", () => {
+  const rows = [
+    ["GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p -f origin main", "ask"],
+    ["env GIT_CONFIG_PARAMETERS=x git p", "ask"],
+    ["export GIT_CONFIG_COUNT=1; git status", "ask"],
+    ["gh alias set m 'pr merge'", "ask"],
+    ["gh -R o/r alias import aliases.yml", "ask"],
+    ["GIT_CONFIG_COUNT=1 ls", null],
+    ["gh alias list", null],
+    // git's plumbing pushes skip the pre-push hook.
+    ["git send-pack origin +x:main", "ask"],
+    ["git -C repo http-push https://example.com/r.git main", "ask"],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
+
+// A shell running what another command prints reads it as `echo … | sh` is read.
+describe("guard: shells fed by cat, <(…), and find -exec", () => {
+  const rows = [
+    ["cat <<EOF | sh\ngit push -f origin main\nEOF", "deny"],
+    ["cat <<<'git push -f origin main' | bash", "deny"],
+    ["bash <(echo git push -f origin main)", "deny"],
+    ["source <(echo git push -f origin main)", "deny"],
+    [". <(printf 'gh pr merge 1')", "ask"],
+    ["bash < <(echo git push -f origin main)", "deny"],
+    // find -exec is read in outline, so what it runs asks.
+    ["find . -exec git push -f origin main \;", "ask"],
+    ["find . -execdir gh pr merge 1 \;", "ask"],
+    ["find . -name x -exec sh -c 'git push -f origin main' \;", "ask"],
+    ["cat <<EOF | sh\necho hi\nEOF", null],
+    ["bash <(echo ls)", null],
+    ["find . -name '*.md' -exec grep -l main {} +", null],
+  ];
+  for (const [command, expected] of rows) it(`${JSON.stringify(command)} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
+
+describe("guard: more writers of the guard's own files", () => {
+  const rows = [
+    ["find .claude -delete", "ask"],
+    ["find . -delete", "ask"],
+    ["find . -name reins.json -delete", "ask"],
+    ["find . -path './.claude/*' -delete", "ask"],
+    ["find node_modules -name '*.mjs' -delete", "ask"],
+    ["ex -sc '%d|x' .claude/settings.json", "ask"],
+    ["ed reins.json", "ask"],
+    ["vim -es -c x .cursor/hooks.json", "ask"],
+    ["find . -name '*.log' -delete", null],
+    ["find dist -type f -delete", null],
+    ["find .claude -name x", null],
+    ["ex -sc x notes.txt", null],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
