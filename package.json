@@ -1,5 +1,5 @@
 {
-  "name": "reins",
+  "name": "bash-bouncer",
   "version": "0.1.0",
   "description": "A command guard for coding agents: refuses or escalates shell commands that only a human should run.",
   "type": "module",

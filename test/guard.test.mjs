@@ -3807,7 +3807,7 @@ describe("guard: unread git words, git config from files, and find -exec writers
     ["find . -path '*/.claude/*' -delete", "ask"],
     ["find . -wholename '*settings.json' -exec rm {} \\;", "ask"],
     ["find . -iname 'REINS*' -exec rm {} \\;", "ask"],
-    ["find . -path './node_modules/.pnpm/re*' -exec rm -rf {} +", "ask"],
+    [`find . -path './node_modules/.pnpm/${core.PACKAGE_NAME.slice(0, 2)}*' -exec rm -rf {} +`, "ask"],
     ["find src -name 'settings*.json' -delete", null],
     ["find . -path './src/*' -exec rm {} \\;", null],
     ["find node_modules -name x -exec rm -rf {} +", "ask"],

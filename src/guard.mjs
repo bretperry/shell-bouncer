@@ -87,7 +87,9 @@ import { runInNewContext } from "node:vm";
 // A key not listed here is an error, so a misspelt one can't drop a file silently.
 // The package's npm name: the one place the code names it (the guard's own package, its install
 // folder). It must equal package.json's "name"; test/package.test.mjs checks that.
-export const PACKAGE_NAME = "reins";
+export const PACKAGE_NAME = "bash-bouncer";
+// The command the package installs (package.json `bin`); the guard protects its link in node_modules/.bin.
+export const BIN_NAME = "reins";
 
 export const DEFAULT_FILES = Object.freeze({ config: "reins.json", ruleDir: null, branches: null });
 
@@ -2438,7 +2440,6 @@ const markerWrites = (list, markerFiles = []) => {
 // The installed package is more than `node_modules/<pkg>/`: the command its hook runs
 // (`node_modules/.bin/<bin>`, a symlink or a shim script, `.cmd` and `.ps1` on Windows), and the
 // package managers' stores, where the files really live (STORES).
-const BIN_NAME = PACKAGE_NAME.replace(/^@[^/]+\//, "");
 const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`, ...["", ".cmd", ".ps1"].map((ext) => `node_modules/.bin/${BIN_NAME}${ext}`)];
 
 // The stores that hold the installed package in a folder named for its version: pnpm's
