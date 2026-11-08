@@ -11,8 +11,15 @@
     "type": "git",
     "url": "https://github.com/bretperry/reins"
   },
-  "exports": "./src/guard.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "reins": "bin/reins.mjs"
+  },
   "files": [
+    "bin/",
     "src/",
     "sets/"
   ],

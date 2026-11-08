@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 
-import { evaluate, loadRules } from "../src/guard.mjs";
+import { BUNDLED_SETS, evaluate, loadRules } from "../src/guard.mjs";
 
 const GUARD = fileURLToPath(new URL("../src/guard.mjs", import.meta.url));
 const SETS = fileURLToPath(new URL("../sets/", import.meta.url));
@@ -26,13 +26,13 @@ const SETS = fileURLToPath(new URL("../sets/", import.meta.url));
 // The guard's code without its comments: whole-line `//` comments and inline `/** @type {…} */`
 // annotations. Nothing else is cut, so no code can hide: a trailing `//` comment on a code line is
 // kept (the code's regexes and globs hold `//` and `/*` too), and a term there fails the test.
-// Also left out: the names in the list of sets the core loads (GUARD_SETS), which names sets, not
+// Also left out: the names in the list of bundled sets (BUNDLED_SETS), which names sets, not
 // rules (`merge-conveyor`). Only the quoted names are cut, so other code on that line is still read.
 const code = readFileSync(GUARD, "utf8")
   .replace(/\/\*\* @type \{.*?\} \*\//g, "")
   .split("\n")
   .filter((line) => !line.trim().startsWith("//"))
-  .map((line) => line.replace(/^const GUARD_SETS = \[(?:"[a-z0-9-]+"(?:, )?)*\];/, "const GUARD_SETS = [];"));
+  .map((line) => line.replace(/^export const BUNDLED_SETS = Object\.freeze\(\[(?:"[a-z0-9-]+"(?:, )?)*\]\);/, "export const BUNDLED_SETS = [];"));
 
 // One team's rules, by the words that name them, read from the shipped sets: each set's name, and
 // the distinctive tokens in its `match` patterns (lowercase words joined by `-` or `:`, or UPPER_SNAKE names).
@@ -72,7 +72,7 @@ const dirs = [];
 after(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
-const NAMES = loadRules(mkdtempSync(join(tmpdir(), "guard-core-root-"))).loaded;
+const NAMES = loadRules(mkdtempSync(join(tmpdir(), "guard-core-root-")), { sets: [...BUNDLED_SETS] }).loaded;
 const setsWith = (text, replaced) => {
   const dir = mkdtempSync(join(tmpdir(), "guard-core-sets-"));
   dirs.push(dir);
@@ -98,7 +98,7 @@ describe("a set with nothing in it refuses every command, as a missing one does"
 describe("emptying each set turns its rows red", () => {
   const root = mkdtempSync(join(tmpdir(), "guard-core-root-"));
   dirs.push(root);
-  const real = loadRules(root);
+  const real = loadRules(root, { sets: [...BUNDLED_SETS] });
   // [set, command, expected decision with the set]: one row per kind of rule the set holds.
   /** @type {[string, string, string][]} */
   const rows = [
