@@ -3640,8 +3640,9 @@ describe("guard: shell-filled git and gh words", () => {
     ["git push -f origin feat:$B", "ask"],
     ["gh $X merge 1", "ask"],
     ["gh pr $(echo merge) 1", "ask"],
-    // Controls: a plain push, a read ref, and gh words past the subcommand stay as they were.
-    ["git push origin $B", "ask"], // the team set's workflow-only branch could be $B; core-only: test/standalone.test.mjs
+    // A plain push's unread ref asks too, as `git push origin main` does (test/standalone.test.mjs).
+    ["git push origin $B", "ask"],
+    // Controls: a read ref and gh words past the subcommand stay as they were.
     ["git push -f origin $B:feat", null],
     ["git push -f $R", null],
     ['git push -f origin "$(git branch --show-current)"', null],
@@ -3706,6 +3707,75 @@ describe("guard: more writers of the guard's own files", () => {
     ["find dist -type f -delete", null],
     ["find .claude -name x", null],
     ["ex -sc x notes.txt", null],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
+
+// The Phase 3 delta review: empty and oversized brace expansions, brace sequences, a shell string
+// built from a substitution or a variable, unread push refs, git config from files, find -exec writers,
+// and unread git flags in front of a read-only subcommand.
+describe("guard: brace expansions as the shell makes them", () => {
+  const rows = [
+    // Bash drops the empty word an unquoted brace makes.
+    ["{git,} push -f origin main", "deny"],
+    ["git push -f origin {main,}", "deny"],
+    // Past 64 words braceWords() gives up, which reads as a match.
+    ["git push -f origin ma{in,x}{,}{,}{,}{,}{,}{,}", "ask"],
+    // Sequences: letters (with a step) and numbers; one bash leaves as typed stays text.
+    ["git push -f origin m{a..b}in", "deny"],
+    ["git push -f origin m{a..z..2}in", "deny"],
+    ["rm -rf .clau{c..e}e", "ask"],
+    ["git push -f origin {main..main}", null],
+    ["git add src/{a,b}.ts", null],
+    ["mkdir -p out/{1..3}", null],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
+
+describe("guard: a shell string this shell builds", () => {
+  const rows = [
+    ['bash -c "$(echo git push -f origin main)"', "deny"],
+    ['sh -c "`printf \'gh pr merge 1\'`"', "ask"],
+    ["X='git push -f origin main'; bash -c \"$X\"", "deny"],
+    ['eval "$(echo git push -f origin main)"', "deny"],
+    // A part the guard can't read asks.
+    ['bash -c "$(cat run.sh)"', "ask"],
+    ['bash -c "$CMD"', "ask"],
+    ['sh -c "cd $D && make"', "ask"],
+    // Controls: the inner shell's own expansions, and eval's everyday setup.
+    ["bash -c 'echo $HOME'", null],
+    ['bash -c "$(echo ls)"', null],
+    ['eval "$(ssh-agent -s)"', null],
+  ];
+  for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
+});
+
+describe("guard: unread git words, git config from files, and find -exec writers", () => {
+  const rows = [
+    // An unread push ref asks wherever a protected branch there would ask.
+    ['git push origin HEAD:"$(echo main)"', "ask"],
+    ['git push origin "HEAD:$B"', "ask"],
+    // Unread words in front of a typed read-only subcommand are its global options.
+    ["git $GIT_FLAGS status", null],
+    ["git $GIT_FLAGS log --oneline", null],
+    ["git $A $B diff", null],
+    ["git $GIT_FLAGS push -f origin main", "ask"],
+    ["git $GIT_FLAGS", "ask"],
+    // A config file read in place of the user's, or included.
+    ["GIT_CONFIG_GLOBAL=/tmp/g git p origin main", "ask"],
+    ["export GIT_CONFIG_SYSTEM=/tmp/g; git status", "ask"],
+    ["git -c include.path=/tmp/g p origin main", "ask"],
+    ["git -c includeIf.onbranch:main.path=/tmp/g status", "ask"],
+    ["git config --global include.path /tmp/g", "ask"],
+    ["GIT_CONFIG_NOSYSTEM=1 git status", null],
+    ["git -c user.name=x commit -m x", null],
+    // find -exec running a writer on what could be a guard file.
+    ["find node_modules -name x -exec rm -rf {} +", "ask"],
+    ["find node_modules -execdir sudo rm {} \;", "ask"],
+    ["find . -name reins.json -exec cp /tmp/x {} \;", "ask"],
+    ["find . -name '*.orig' -exec rm {} \;", null],
+    ["find /tmp/elsewhere -name x -exec rm {} \;", null],
+    ["find . -name x -exec grep y {} \;", null],
   ];
   for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
 });
