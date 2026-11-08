@@ -13,7 +13,7 @@
 import "./tmpdir.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { BUNDLED_SETS, evaluate, loadRules, PACKAGE_NAME } from "../src/index.mjs";
 
 const BIN = fileURLToPath(new URL("../bin/reins.mjs", import.meta.url));
+const GUARD = fileURLToPath(new URL("../src/guard.mjs", import.meta.url));
 const TEAM = fileURLToPath(new URL("./fixtures/team.json", import.meta.url));
 
 // A temp folder holding `files` (an object is written as JSON), not a git repo.
@@ -98,6 +99,22 @@ describe("the core alone: a bare repo with no reins.json", () => {
     ["npm uninstall reins", "ask"],
     ["pnpm add left-pad", null],
     ["pnpm install", null],
+    // The installed package is also its bin and the package managers' store folders.
+    [`echo x > node_modules/.bin/${PACKAGE_NAME}`, "ask"],
+    [`rm node_modules/.bin/${PACKAGE_NAME}.cmd`, "ask"],
+    ["rm -rf node_modules/.pnpm", "ask"],
+    [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@0.1.0`, "ask"],
+    [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@*`, "ask"],
+    [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@0.1.0/*`, "ask"],
+    [`echo x > node_modules/.pnpm/${PACKAGE_NAME}@0.1.0/node_modules/${PACKAGE_NAME}/src/guard.mjs`, "ask"],
+    [`rm -rf node_modules/.bun/${PACKAGE_NAME}@0.1.0`, "ask"],
+    [`rm .yarn/cache/${PACKAGE_NAME}-npm-0.1.0-0123abcd-89ef.zip`, "ask"],
+    ["rm -rf node_modules/.pnpm/left-pad@1.3.0", null],
+    [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}x@1.0.0`, null],
+    ["rm node_modules/.bin/prisma", null],
+    // A plain push whose branch the shell fills in is read as before; a forced one asks (test/guard.test.mjs).
+    ["git push origin $B", null],
+    ["git push -f origin $B", "ask"],
   ];
   for (const [command, expected] of rows) {
     it(`${command} → ${String(expected)}`, () => assert.equal(decisionIn(root, command), expected));
@@ -111,6 +128,21 @@ describe("the core alone: a bare repo with no reins.json", () => {
   it("the package-manager rule names the package by its one constant", () => {
     assert.equal(PACKAGE_NAME, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).name);
     assert.equal(evaluate(`npm i ${PACKAGE_NAME}`, { branch: "feat" })?.decision, "ask");
+  });
+
+  it("the old entry, node src/guard.mjs claude|cursor, still runs the hook", () => {
+    const env = { ...process.env, CLAUDE_PROJECT_DIR: root };
+    for (const name of ["REINS", "WHIPPLETREE_GUARD"]) delete env[name];
+    const input = JSON.stringify({ tool_input: { command: "git push --force origin main" }, cwd: root });
+    const claude = spawnSync(process.execPath, [GUARD, "claude"], { input, env, encoding: "utf8" });
+    assert.equal(claude.status, 0, claude.stderr);
+    assert.equal(JSON.parse(claude.stdout).hookSpecificOutput.permissionDecision, "deny");
+    const cursor = spawnSync(process.execPath, [GUARD, "cursor"], { input, env, encoding: "utf8" });
+    assert.equal(cursor.status, 0, cursor.stderr);
+    assert.equal(JSON.parse(cursor.stdout).permission, "deny");
+    const unknown = spawnSync(process.execPath, [GUARD, "vscode"], { input, env, encoding: "utf8" });
+    assert.equal(unknown.status, 2);
+    assert.match(unknown.stderr, /reins hook claude\|cursor/);
   });
 
   it("REINS=off and the old WHIPPLETREE_GUARD=off both turn the hook off; another value doesn't", () => {
@@ -172,6 +204,7 @@ describe("reins.json: the config at the project root", () => {
   it("askTags is read and checked, for the ask gate", () => {
     assert.deepEqual(loadRules(folder({ "reins.json": { askTags: { tags: ["only-you"], tools: "AskUserQuestion" } } })).askTags, { tags: ["only-you"], refusal: undefined, tools: ["AskUserQuestion"], log: undefined });
     assert.equal(loadRules(folder()).askTags, null);
+    assert.equal(loadRules(folder({ "reins.json": { askTags: { tags: ["only-you"], log: "logs/asks.jsonl" } } })).askTags?.log, "logs/asks.jsonl");
   });
 });
 
@@ -277,6 +310,29 @@ describe("the loader refuses every command when what it was told to read doesn't
       refusesAll(loadRules(folder({ "reins.json": { allow: [{ command, reason: "x" }] } }), { sets: [TEAM] }), /allow\[0\]\.command meets a built-in rule an exemption can't lift/);
     }
     refusesAll(loadRules(folder({ "reins.json": { sets: ["draft-flow"], allow: [{ command: "gh pr ready 3", reason: "x" }] } })), /allow\[0\]\.command meets a built-in rule an exemption can't lift/);
+  });
+
+  it("askTags.log in reins.json outside the project: absolute, `..`, or `~/`", () => {
+    for (const log of ["/tmp/asks.jsonl", "../asks.jsonl", "logs/../../asks.jsonl", "~/asks.jsonl"]) {
+      refusesAll(loadRules(folder({ "reins.json": { askTags: { tags: ["only-you"], log } } })), /askTags\.log must be a path inside the project/);
+    }
+  });
+
+  it("a config, rule folder, or pack file linked to a path outside the project", () => {
+    const outside = folder({ "rules.json": { allow: [{ command: "ls" }] }, "d/x.json": { ask: [{ match: "^ls$", reason: "Outside." }] } });
+    const linked = (path, target, extra = {}) => {
+      const root = folder(extra);
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      symlinkSync(target, join(root, path));
+      return root;
+    };
+    refusesAll(loadRules(linked("reins.json", join(outside, "rules.json"))), /reins\.json is a link to a path outside the project/);
+    refusesAll(loadRules(linked("rules.d", join(outside, "d"), { "reins.json": { ruleDir: "rules.d" } })), /rules\.d is a link to a path outside the project/);
+    refusesAll(loadRules(linked("rules.d/x.json", join(outside, "d/x.json"), { "reins.json": { ruleDir: "rules.d" } })), /rules\.d\/x\.json is a link to a path outside the project/);
+    // A link that stays inside the project is read.
+    const inside = linked("reins.json", "config/reins.json", { "config/reins.json": { ask: [{ match: "^make\\b", reason: "Inside." }] } });
+    assert.equal(loadRules(inside).error, "");
+    assert.equal(evaluate("make", { branch: "feat", rules: loadRules(inside) })?.decision, "ask");
   });
 
   it("an unknown config key, or a knob of the wrong shape", () => {

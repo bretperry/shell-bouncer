@@ -73,6 +73,8 @@ describe("the package's shape", () => {
     assert.equal(PKG.dependencies, undefined);
     assert.equal(PKG.devDependencies, undefined);
     assert.equal(reins.PACKAGE_NAME, PKG.name);
+    // The guard protects node_modules/.bin/<the package's name, unscoped>, so the bin must carry that name.
+    assert.ok(Object.hasOwn(PKG.bin, reins.PACKAGE_NAME.replace(/^@[^/]+\//, "")));
   });
 
   it("exports the API's names", () => {

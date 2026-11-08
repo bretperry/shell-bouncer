@@ -1,0 +1,35 @@
+# Runs the test suite (`npm test`) on the oldest Node the package supports and on the newest release.
+# Used by: pushes to main and pull requests; the package's `engines` says Node >=22, so 22 is the floor.
+# Uses: package.json's `test` script (node --test); no install step, since the package has no dependencies.
+# Needs: nothing; no secrets, read-only token.
+# Runner: GitHub-hosted on purpose. Actions stay off on this repo until it is public, and a public
+# repo's hosted minutes are free; a fork's PR must never run on the owner's own machines.
+# Node: `22` is the newest 22.x; `current` is setup-node's alias for the newest Node release.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22", current]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Tests
+        run: npm test
