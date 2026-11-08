@@ -1465,7 +1465,7 @@ const evaluateLine = (command, options) => {
       // `source <(echo '…')` runs what the command in `<(…)` prints, here.
       for (const target of runs(parsed.words)) {
         for (const line of target.printed === undefined ? [] : printedLines(target.printed)) {
-          const inner = line === FED_TOO_LONG ? ask(FED_TOO_LONG_ASK) : nested(line, inline);
+          const inner = fedAsk(line) ?? nested(line, inline);
           if (inner) verdicts.push(inner);
         }
       }
@@ -1478,9 +1478,11 @@ const evaluateLine = (command, options) => {
     const targets = runs(parsed.words);
     const followed = new Set();
     const follow = (line, extra) => {
-      // A long script `cat` or `<(…)` prints into a shell asks rather than being read (printedBy()).
-      if (line === FED_TOO_LONG) {
-        verdicts.push(ask(FED_TOO_LONG_ASK));
+      // A long script `cat` or `<(…)` prints into a shell, or a printf format the guard doesn't
+      // model, asks rather than being read (printedBy()).
+      const unread = fedAsk(line);
+      if (unread !== null) {
+        verdicts.push(unread);
         return;
       }
       if (followed.has(line)) return;
@@ -1494,13 +1496,27 @@ const evaluateLine = (command, options) => {
       if (target.line === undefined && target.stdin !== true) continue;
       if (target.via === "eval") loseTrack();
       const extra = SHELL.test(target.via ?? "") ? {} : (LINE_FLAGS[target.via ?? ""] ?? { lost: true, wrapped: true });
-      for (const line of target.line === undefined ? fedLines(parsed, before) : [target.line]) follow(line, extra);
-      // `bash -c "$(echo git push …)"`, `eval "$X"`: the line as this shell builds it (builtLines()).
-      if (target.built === true && target.line !== undefined && (SHELL.test(target.via ?? "") || target.via === "eval")) {
-        const built = builtLines(target.line, filledWith(lineEnv));
-        if (built === null && target.via !== "eval") verdicts.push(ask(BUILT_LINE_ASK));
-        for (const line of built ?? []) follow(line, extra);
+      // A string this shell builds (`bash -c "$(echo git push …)"`, `eval "$X"`) is read as built
+      // (builtLines()), never as typed: typed, its `$(…)` would read as the wrapper's own command.
+      const built = target.built === true && target.line !== undefined && (SHELL.test(target.via ?? "") || target.via === "eval");
+      for (const line of target.line === undefined ? fedLines(parsed, before) : built ? [] : [target.line]) follow(line, extra);
+      if (built && target.line !== undefined) {
+        const lines = builtLines(target.line, filledWith(lineEnv));
+        if (lines === null && target.via !== "eval") verdicts.push(ask(BUILT_LINE_ASK));
+        for (const line of lines?.printed ?? []) follow(line, extra);
+        if (lines?.filled !== undefined) follow(lines.filled, { ...extra, lost: true });
       }
+    }
+    // `$(echo git push -f origin main)` as the command: the shell runs what the substitution prints,
+    // with the words after it; a substitution whose output the guard doesn't read asks.
+    for (const target of targets) {
+      const program = target.argv?.[0];
+      const inner = program?.dynamic === true && target.xargs === false ? wholeSubstitution(program.value) : null;
+      if (inner === null) continue;
+      const printed = printedLines(inner);
+      if (printed.length === 0) verdicts.push(ask(PRINTED_COMMAND_ASK));
+      const rest = (target.argv ?? []).slice(1).map((word) => (word.dynamic ? word.value : shellQuote(word.value))).join(" ");
+      for (const line of printed) follow(fedAsk(line) !== null || rest === "" ? line : `${line} ${rest}`, {});
     }
     // `find … -exec X {} \;` (and -execdir, -ok, -okdir) runs X once per file, a wrapper the guard
     // reads only in outline (as judge()'s fallback reads others): a verdict on X asks.
@@ -1595,10 +1611,11 @@ const evaluateLine = (command, options) => {
       const filledArgv = programArgv(program.map(fill));
       if (filledArgv.some((word, at) => word !== argv[at])) found.push(...policyVerdicts(filledArgv.join(" "), sets.program), pushVerdict(filledArgv), evaluateGitConfig(filledArgv, sets.gitConfigAsk), evaluateGhApi(filledArgv, fill(segment), branches, sets), evaluateGhVariable(filledArgv, sets.repoVariables));
       // The program again as the shell expands its braces (`git push -f origin ma{in,x}`, `{git,push} …`,
-      // `m{a..b}in`), each way bracedArgvs() reads it; too many words to read asks.
+      // `m{a..b}in`), each way bracedArgvs() reads it. Too many words to read asks where the rules
+      // read them: a braced program, or git, gh, or a program a rule-set row names (`touch f{1..100}` doesn't).
       const words = programWords[index] ?? [];
       const bracings = bracedArgvs(words);
-      if (bracings === null) found.push(ask(BRACE_TOO_MANY_ASK));
+      if (bracings === null && (words[0]?.brace === true || /^(git|gh)$/.test(argv[0] ?? "") || rowsName(sets.program, argv[0] ?? ""))) found.push(ask(BRACE_TOO_MANY_ASK));
       for (const braced of bracings ?? []) found.push(...policyVerdicts(braced.join(" "), sets.program), pushVerdict(braced), evaluateGitConfig(braced, sets.gitConfigAsk));
       // What the shell fills in where the git and gh rules read a word by name (unreadGit()).
       found.push(unreadGit(words, fill, branches, pushVerdict));
@@ -1679,31 +1696,125 @@ const fedLines = (parsed, before) => {
 const printedBy = (list, heredocs, herestrings) => {
   const start = programStart(list);
   const printer = programName(list[start] ?? "");
-  if (/^(echo|printf)$/.test(printer)) return [list.slice(start + 1).filter((word) => !/^-[neE]+$/.test(word)).join(" ")];
+  if (printer === "printf") return [printfOutput(list.slice(start + 1))];
+  // echo's escapes (`-e`, and sh's echo by default) read both ways.
+  if (printer === "echo") {
+    const words = list.slice(start + 1);
+    let at = 0;
+    while (at < words.length && /^-[neE]+$/.test(words[at] ?? "")) at += 1;
+    const text = words.slice(at).join(" ");
+    const escaped = printfEscapes(text).text;
+    return escaped === text ? [text] : [text, escaped];
+  }
   if (printer === "cat") return [...heredocs.map((doc) => doc.body), ...herestrings.map((word) => word.value)].map((text) => (text.length > MAX_FED_CHARS ? FED_TOO_LONG : text));
   return [];
 };
 const MAX_FED_CHARS = 16 * 1024;
+
+// The text printf prints for its words: the format's `%s`, `%b`, `%c`, `%d`, and `%i` (with
+// flags, width, and precision) and its escapes, reused while arguments remain, as bash's printf
+// does. A format the guard doesn't model (`%x`, `%q`, `%*s`) is FED_UNREAD, which asks.
+const printfOutput = (words) => {
+  let at = 0;
+  if (words[at] === "-v") at += 2;
+  if (words[at] === "--") at += 1;
+  const format = printfEscapes(words[at] ?? "", true).text;
+  const args = words.slice(at + 1);
+  let out = "";
+  let used = 0;
+  do {
+    let converted = 0;
+    const done = format.replace(/%([-+ #0]*)(\d*)(?:\.(\d*))?(.?)/g, (whole, _flags, width, precision, kind) => {
+      if (kind === "%" && whole === "%%") return "%";
+      if (!/^[sbcdi]$/.test(kind) || used === Infinity) {
+        used = Infinity;
+        return "";
+      }
+      converted += 1;
+      let value = args[used] ?? "";
+      used += 1;
+      if (kind === "b") value = printfEscapes(value).text;
+      if (kind === "c") value = value.slice(0, 1);
+      if (kind === "s" || kind === "b") value = precision === undefined ? value : value.slice(0, Number(precision || 0));
+      return value.padStart(Number(width || 0));
+    });
+    if (used === Infinity) return FED_UNREAD;
+    out += done;
+    if (converted === 0) break;
+  } while (used < args.length && out.length <= MAX_FED_CHARS);
+  return out.length > MAX_FED_CHARS ? FED_TOO_LONG : out;
+};
+
+// A string with printf's (and `echo -e`'s) backslash escapes applied: `\n`, `\t`, `\\`, `\xHH`,
+// octal `\0NNN` (and `\NNN` in a format). `text` is the result.
+const printfEscapes = (text, format = false) => {
+  const simple = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", E: "\x1b", "\\": "\\", '"': '"', "'": "'" };
+  const octal = format ? /^[0-7]{1,3}/ : /^0[0-7]{0,3}/;
+  let out = "";
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at] ?? "";
+    const next = text[at + 1] ?? "";
+    if (char !== "\\" || next === "") {
+      out += char;
+      continue;
+    }
+    const rest = text.slice(at + 1);
+    const hex = /^x([0-9A-Fa-f]{1,2})/.exec(rest);
+    const oct = octal.exec(rest);
+    if (hex) {
+      out += String.fromCharCode(parseInt(hex[1] ?? "0", 16));
+      at += hex[0].length;
+    } else if (oct) {
+      out += String.fromCharCode(parseInt(oct[0], 8) & 255);
+      at += oct[0].length;
+    } else if (Object.hasOwn(simple, next)) {
+      out += simple[next];
+      at += 1;
+    } else out += char;
+  }
+  return { text: out };
+};
 // Not a line the parser can produce, so it can't be confused with one.
 const FED_TOO_LONG = "\0fed-too-long";
 const FED_TOO_LONG_ASK = `A shell here runs a script over ${MAX_FED_CHARS / 1024} KB that \`cat\` or \`<(…)\` prints, longer than the guard reads; the user confirms what it runs.`;
+const FED_UNREAD = "\0fed-unread";
+const FED_UNREAD_ASK = "A shell here runs what a `printf` format prints that the guard doesn't read (only %s, %b, %c, %d, and %i are); the user confirms what it runs.";
+// The ask for a fed line the guard didn't read (FED_TOO_LONG, FED_UNREAD), or null for a line it did.
+const fedAsk = (line) => (line === FED_TOO_LONG ? ask(FED_TOO_LONG_ASK) : line === FED_UNREAD ? ask(FED_UNREAD_ASK) : null);
 
-// The lines a shell's `-c` string (or `eval`'s) runs when this shell filled part of it in: the
-// variables this line set, filled in by `fill`; for a string that is one substitution, what its
-// command prints, when the guard reads it (`"$(echo git push …)"`, as `echo … | sh` is read).
-// null when part of it stays unread (`"$X"`, `"$(cat f)"`, `"cd $D && make"`): the text there
-// could hold any command, so a shell running it asks (`eval` keeps its old reading, since
-// `eval "$(ssh-agent -s)"` and its like are everyday setup).
+// What a shell's `-c` string (or `eval`'s) runs when this shell filled part of it in, with the
+// variables this line set filled in by `fill`: `printed`, what a string that is one substitution
+// prints, when the guard reads it (`"$(echo git push …)"`, as `echo … | sh` is read); else
+// `filled`, the line to read with its other variables unseen (`"cd $D && make"`). null when an
+// unread part is a command (`"$X"`, `"$(cat f)"`, `"ls; $CMD"`), which could be anything, so a
+// shell running it asks (`eval` keeps its old reading, since `eval "$(ssh-agent -s)"` and its
+// like are everyday setup). A substitution command whose output the guard reads is read where the
+// line runs (PRINTED_COMMAND_ASK).
 const builtLines = (line, fill) => {
   const filled = fill(line);
-  const sub = /^\$\(/.test(filled) ? closeParen(filled, 2) : filled.startsWith("`") ? closeTick(filled, 1) : -1;
-  if (sub === filled.length - 1) {
-    const printed = printedLines(filled.slice(filled.startsWith("`") ? 1 : 2, sub));
-    return printed.length === 0 ? null : printed;
+  const inner = wholeSubstitution(filled);
+  if (inner !== null) {
+    const printed = printedLines(inner);
+    return printed.length === 0 ? null : { printed };
   }
-  return /[$`]/.test(filled) ? null : [filled];
+  for (const command of parseLine(filled).commands) {
+    for (const target of runs(command.words)) {
+      const program = target.argv?.[0];
+      if (program === undefined || !program.dynamic || !/[$`]/.test(program.value)) continue;
+      const sub = wholeSubstitution(program.value);
+      if (sub === null || printedLines(sub).length === 0) return null;
+    }
+  }
+  return { filled };
 };
 const BUILT_LINE_ASK = "A shell here runs a command string built from a variable or a substitution the guard can't read; the user confirms what it runs.";
+const PRINTED_COMMAND_ASK = "The command here is what a substitution prints, which the guard can't read; the user confirms what it runs.";
+
+// The command inside a word that is exactly one substitution (`$(…)` or backticks), else null.
+const wholeSubstitution = (word) => {
+  const end = word.startsWith("$(") ? closeParen(word, 2) : word.startsWith("`") ? closeTick(word, 1) : -1;
+  return end !== -1 && end === word.length - 1 ? word.slice(word.startsWith("`") ? 1 : 2, end) : null;
+};
 
 // What the commands in a `<(…)` print, for a shell that runs it (`bash <(…)`, `source <(…)`).
 const printedLines = (text) => parseLine(text).commands.flatMap((command) => printedBy(command.tokens, command.heredocs, command.herestrings));
@@ -1734,6 +1845,13 @@ const bracedArgvs = (words) => {
   const dropped = lists.flatMap((each, at) => (words[at]?.brace ? (each ?? []).filter((value) => value !== "") : (each ?? [])));
   return (dropped.length === kept.length ? [kept] : [kept, dropped]).map(programArgv);
 };
+// True when a row of `rows` names `program` in its pattern (escapes such as `\b` aside), so it may
+// read that program's words: a loose test that leans toward a match.
+const rowsName = (rows, program) => {
+  if (program === "") return true;
+  const name = new RegExp(`(^|[^A-Za-z0-9_-])${program.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9_-]|$)`, "i");
+  return rows.some((row) => name.test(row.match.source.replace(/\\[bBsSwWdD]/g, " ")));
+};
 const BRACE_TOO_MANY_ASK = "A brace expansion here makes more words than the guard reads (over 64); the user confirms what it runs.";
 
 // GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>, GIT_CONFIG_PARAMETERS: git config set
@@ -1748,8 +1866,7 @@ const UNREAD_GIT_ASK = "The git or gh command here, or the branch a forced or de
 // Asks when the shell fills in, at run time, a word the git and gh rules read by name: the program
 // (`$G push …`, `$(which git) push …`), git's subcommand (`git $(echo push) …`), gh's (`gh $X merge`,
 // `gh pr $(echo merge)`), or a ref of a push that would be refused or asked about if it named a
-// protected branch (`git push -f origin "$(echo main)"`, `${B:-main}`, `HEAD:"$B"`). Unread words
-// in front of a typed read-only subcommand (`git $GIT_FLAGS status`) don't ask. `words` is one program's parsed words;
+// protected branch (`git push -f origin "$(echo main)"`, `${B:-main}`, `HEAD:"$B"`). `words` is one program's parsed words;
 // `fill` fills in the variables this line set (a word it fills is read by the rules already);
 // `pushVerdict` judges a push's argv as evaluatePush() does.
 const unreadGit = (words, fill, branches, pushVerdict) => {
@@ -1764,14 +1881,8 @@ const unreadGit = (words, fill, branches, pushVerdict) => {
   }
   if (argv[0] !== "git") return null;
   const { sub } = gitGlobals(argv);
-  if (unread(words[sub])) {
-    // `git $GIT_FLAGS status`: unread words in front of a typed read-only subcommand are read as
-    // git's global options. (Were they a subcommand, the read-only word would be its argument.)
-    let next = sub;
-    while (next < words.length && unread(words[next])) next += 1;
-    const typed = words[next];
-    return typed !== undefined && !typed.dynamic && GIT_READ_ONLY.has(typed.value) ? null : ask(UNREAD_GIT_ASK);
-  }
+  // `git $GIT_FLAGS status` asks too: `${X:-push -f origin main}` there is a push.
+  if (unread(words[sub])) return ask(UNREAD_GIT_ASK);
   if (argv[sub] !== "push") return null;
   // `"$(git branch --show-current)"` is the branch it runs on, which the push rule reads as HEAD.
   const base = argv.map((value, at) => (at > sub && CURRENT_BRANCH.test(value) ? "HEAD" : value));
@@ -1793,8 +1904,6 @@ const unreadGit = (words, fill, branches, pushVerdict) => {
   }
   return null;
 };
-// git subcommands that only read: unread words in front of one are its global options (unreadGit()).
-const GIT_READ_ONLY = new Set(["status", "log", "diff", "show", "blame", "grep", "describe", "shortlog", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "show-ref", "for-each-ref", "name-rev", "merge-base", "whatchanged", "version", "help"]);
 
 // Each act's reason, shared by its gh subcommand and the API road to the same act. The gh
 // subcommands' rows for a ready PR, a rerun, and a dispatch are in the draft-flow and ci-minutes rule
@@ -2534,9 +2643,45 @@ const findDeletes = (args, dir, guard) => {
   const roots = (first === -1 ? args : args.slice(0, first)).map((root) => storeKey(fileKey(dir, root).replace(/\/+$/, "")));
   const filters = args.flatMap((word, at) => (/^-i?(name|path|wholename)$/.test(word) ? [normalize(args[at + 1] ?? "").replace(/\/+$/, "")] : []));
   if (roots.some((root) => guard.match.test(root) || holdsGuardFile(root, guard))) return true;
-  if (filters.length > 0) return filters.some((filter) => couldBeGuardFile(filter, guard));
-  return roots.length === 0 || roots.includes(".");
+  if (filters.length === 0) return roots.length === 0 || roots.includes(".");
+  if (filters.some((filter) => couldBeGuardFile(filter, guard))) return true;
+  // A glob filter, read as find reads it, against the guard's files under each starting point in
+  // the project: -name and -iname against each name on a guard file's path, -path and -wholename
+  // (and -ipath, -iwholename) against the whole path find prints (`./.claude/settings.json`, its
+  // folders, and a file inside a guard folder).
+  const typed = first === -1 ? args : args.slice(0, first);
+  const under = (typed.length === 0 ? ["."] : typed).flatMap((root) => {
+    const key = fileKey(dir, root).replace(/\/+$/, "");
+    if (isAbsolute(key) || key.startsWith("..")) return [];
+    const base = key === "." ? "" : `${key.toLowerCase()}/`;
+    const shown = root.replace(/\/+$/, "").toLowerCase() || "/";
+    return guard.files.filter((each) => !isAbsolute(each) && each.startsWith(base)).map((each) => ({ shown, file: each, rel: each.slice(base.length) }));
+  });
+  const named = (glob, part, store) => (store ? storeCould(glob, part) : globSegment(glob).test(part));
+  for (const [at, word] of args.entries()) {
+    const glob = (args[at + 1] ?? "").toLowerCase();
+    if (/^-i?name$/.test(word)) {
+      if (under.some(({ file, rel }) => rel.split("/").some((part, index, parts) => named(glob, part, STORE_GUARDS.has(file) && index === parts.length - 1)))) return true;
+    } else if (/^-i?(path|wholename)$/.test(word)) {
+      const whole = globSegment(glob);
+      const could = ({ shown, file, rel }) => {
+        const parts = rel.split("/");
+        const store = STORE_GUARDS.has(file);
+        // The file, each folder above it, and (for a folder) a file inside it; a store folder by any version.
+        const path = `${shown}/${rel}`;
+        const paths = [...parts.map((_, index) => `${shown}/${parts.slice(0, index + 1).join("/")}`), ...(guard.dirs.has(file) ? [`${path}${store ? "0.0.0" : ""}/\u0001`] : [])];
+        return paths.some((each) => whole.test(each)) || (store && storeCould(glob, path));
+      };
+      if (under.some(could)) return true;
+    }
+  }
+  return false;
 };
+
+// True when a glob could name a store folder whose name starts with `prefix`: one that matches it
+// with a version after (`reins@0.0.0`), or whose head isn't a `*` and fits the prefix (`re?ns@0.2.0`;
+// globCouldStart()), so `*.orig` doesn't.
+const storeCould = (glob, prefix) => globSegment(glob).test(`${prefix}0.0.0`) || (!glob.startsWith("*") && globCouldStart(glob, prefix));
 
 // "loopback" when every host is this machine, "remote" when any isn't, "unknown" when there are none.
 const hostsKind = (hosts) => {

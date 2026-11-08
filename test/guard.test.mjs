@@ -3728,6 +3728,11 @@ describe("guard: brace expansions as the shell makes them", () => {
     ["git push -f origin {main..main}", null],
     ["git add src/{a,b}.ts", null],
     ["mkdir -p out/{1..3}", null],
+    // Too many words asks only where the rules read them: git, gh, a braced program.
+    ["gh pr view {1..100}", "ask"],
+    ["{git,x}{,}{,}{,}{,}{,}{,} push -f origin main", "ask"],
+    ["touch f{1..100}.txt", null],
+    ["mkdir -p a{1..9}/b{1..9}", null],
   ];
   for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
 });
@@ -3738,14 +3743,35 @@ describe("guard: a shell string this shell builds", () => {
     ['sh -c "`printf \'gh pr merge 1\'`"', "ask"],
     ["X='git push -f origin main'; bash -c \"$X\"", "deny"],
     ['eval "$(echo git push -f origin main)"', "deny"],
-    // A part the guard can't read asks.
+    ['sh -c "$(echo git push -f origin main) && ls"', "deny"],
+    ['bash -c "$(echo $(echo git push -f origin main))"', "deny"],
+    ['bash -c "$(printf \'%s \' git push -f origin main)"', "deny"],
+    ['bash -c "git push -f origin $(echo main)"', "ask"],
+    // An unread part that is the whole string or a command asks.
     ['bash -c "$(cat run.sh)"', "ask"],
     ['bash -c "$CMD"', "ask"],
-    ['sh -c "cd $D && make"', "ask"],
+    ['bash -c "ls; $CMD"', "ask"],
+    // Elsewhere the line is read with its variables unseen (was ask in fix2).
+    ['sh -c "cd $D && make"', null],
+    ['bash -c "echo $HOME"', null],
+    ['bash -c "npm test -- $ARGS"', null],
     // Controls: the inner shell's own expansions, and eval's everyday setup.
     ["bash -c 'echo $HOME'", null],
     ['bash -c "$(echo ls)"', null],
     ['eval "$(ssh-agent -s)"', null],
+    // A substitution as the command runs what it prints.
+    ["$(echo git push -f origin main)", "deny"],
+    ["$(echo $(echo git push -f origin main))", "deny"],
+    ["`echo git push -f origin main`", "deny"],
+    ["$(echo git push) -f origin main", "deny"],
+    ["$(cat f)", "ask"],
+    ["echo $(date)", null],
+    // printf's format is applied; one the guard doesn't model asks.
+    ["printf '%s ' git push -f origin main | sh", "deny"],
+    ["printf 'git push -f origin m%sin' a | sh", "deny"],
+    ["printf '%x' 1 | sh", "ask"],
+    ["echo -e 'git push -f origin m\\x61in' | sh", "deny"],
+    ["printf 'hi\\n' | sh", null],
   ];
   for (const [command, expected] of rows) it(`${command} → ${String(expected)}`, () => assert.equal(verdictOf(command), expected));
 });
@@ -3755,10 +3781,15 @@ describe("guard: unread git words, git config from files, and find -exec writers
     // An unread push ref asks wherever a protected branch there would ask.
     ['git push origin HEAD:"$(echo main)"', "ask"],
     ['git push origin "HEAD:$B"', "ask"],
-    // Unread words in front of a typed read-only subcommand are its global options.
-    ["git $GIT_FLAGS status", null],
-    ["git $GIT_FLAGS log --oneline", null],
-    ["git $A $B diff", null],
+    // An unread word where git's subcommand goes asks, even in front of a read-only one: it can be
+    // the subcommand itself (fix2 let these through; `${X:-push -f origin main}` force-pushed).
+    ["git $GIT_FLAGS status", "ask"],
+    ["git $GIT_FLAGS log --oneline", "ask"],
+    ["git $A $B diff", "ask"],
+    ["git ${X:-push -f origin main} status", "ask"],
+    ["read X <<< 'push -f origin main'; git $X status", "ask"],
+    ["X=$(echo push -f origin main); git $X status", "ask"],
+    ['git "$X" "$Y" status', "ask"],
     ["git $GIT_FLAGS push -f origin main", "ask"],
     ["git $GIT_FLAGS", "ask"],
     // A config file read in place of the user's, or included.
@@ -3769,7 +3800,16 @@ describe("guard: unread git words, git config from files, and find -exec writers
     ["git config --global include.path /tmp/g", "ask"],
     ["GIT_CONFIG_NOSYSTEM=1 git status", null],
     ["git -c user.name=x commit -m x", null],
-    // find -exec running a writer on what could be a guard file.
+    // find -exec running a writer on what could be a guard file, by a starting point or a glob.
+    ["find . -name 'settings*.json' -exec sed -i s/a/b/ {} +", "ask"],
+    ["find . -name 'settings*.json' -delete", "ask"],
+    ["find . -path '*/.claude/*' -exec rm {} \\;", "ask"],
+    ["find . -path '*/.claude/*' -delete", "ask"],
+    ["find . -wholename '*settings.json' -exec rm {} \\;", "ask"],
+    ["find . -iname 'REINS*' -exec rm {} \\;", "ask"],
+    ["find . -path './node_modules/.pnpm/re*' -exec rm -rf {} +", "ask"],
+    ["find src -name 'settings*.json' -delete", null],
+    ["find . -path './src/*' -exec rm {} \\;", null],
     ["find node_modules -name x -exec rm -rf {} +", "ask"],
     ["find node_modules -execdir sudo rm {} \;", "ask"],
     ["find . -name reins.json -exec cp /tmp/x {} \;", "ask"],
