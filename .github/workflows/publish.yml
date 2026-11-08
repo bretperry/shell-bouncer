@@ -1,4 +1,4 @@
-# Publishes reins to npm, with provenance, when a v* tag is pushed. Nothing else publishes.
+# Publishes reins (npm package bash-bouncer) to npm, with provenance, when a v* tag is pushed. Nothing else publishes.
 # Trigger: a tag push only. No branch push, pull request, schedule, or manual run starts it.
 # Needs: NPM_TOKEN (an npm automation token scoped to this package) as a secret of the `publish` Environment, not a repository secret:
 #   Settings > Environments > publish, with the owner as a required reviewer, so a tag push waits for a click before the token is released.

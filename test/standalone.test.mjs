@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { BUNDLED_SETS, evaluate, loadRules, PACKAGE_NAME } from "../src/index.mjs";
+import { BIN_NAME, BUNDLED_SETS, evaluate, loadRules, PACKAGE_NAME } from "../src/index.mjs";
 
 const BIN = fileURLToPath(new URL("../bin/reins.mjs", import.meta.url));
 const GUARD = fileURLToPath(new URL("../src/guard.mjs", import.meta.url));
@@ -94,14 +94,14 @@ describe("the core alone: a bare repo with no reins.json", () => {
     // The guard's own files and package.
     ["rm reins.json", "ask"],
     ["echo '{}' > .claude/settings.json", "ask"],
-    ["rm -rf node_modules/reins", "ask"],
-    ["pnpm add -D reins@0.2.0", "ask"],
-    ["npm uninstall reins", "ask"],
+    [`rm -rf node_modules/${PACKAGE_NAME}`, "ask"],
+    [`pnpm add -D ${PACKAGE_NAME}@0.2.0`, "ask"],
+    [`npm uninstall ${PACKAGE_NAME}`, "ask"],
     ["pnpm add left-pad", null],
     ["pnpm install", null],
     // The installed package is also its bin and the package managers' store folders.
-    [`echo x > node_modules/.bin/${PACKAGE_NAME}`, "ask"],
-    [`rm node_modules/.bin/${PACKAGE_NAME}.cmd`, "ask"],
+    [`echo x > node_modules/.bin/${BIN_NAME}`, "ask"],
+    [`rm node_modules/.bin/${BIN_NAME}.cmd`, "ask"],
     ["rm -rf node_modules/.pnpm", "ask"],
     [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@0.1.0`, "ask"],
     [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@*`, "ask"],

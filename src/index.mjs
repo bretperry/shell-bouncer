@@ -7,5 +7,5 @@
 // Env: none here.
 // Writes: nothing.
 // Exit: n/a (a module).
-export { BUNDLED_SETS, DEFAULT_FILES, PACKAGE_NAME, DEFAULT_OFF_ENV, LIMITS, WATCHDOG_MS, askTagsOf, destroysSql, dotenvValue, evaluate, hookVerdict, loadRules, main, parseLine, respond, shipFreeze, targetOf, words } from "./guard.mjs";
+export { BIN_NAME, BUNDLED_SETS, DEFAULT_FILES, PACKAGE_NAME, DEFAULT_OFF_ENV, LIMITS, WATCHDOG_MS, askTagsOf, destroysSql, dotenvValue, evaluate, hookVerdict, loadRules, main, parseLine, respond, shipFreeze, targetOf, words } from "./guard.mjs";
 export * as askGate from "./ask-gate.mjs";
