@@ -6,7 +6,7 @@ project can still be relicensed. Until that exists, a pull request from outside 
 
 What helps now:
 
-- **Bug reports and questions:** open an issue at <https://github.com/bretperry/reins/issues>. Say what you ran,
+- **Bug reports and questions:** open an issue at <https://github.com/bretperry/shell-bouncer/issues>. Say what you ran,
   what you expected, and what happened.
 - **Security problems:** do not open an issue. Follow `SECURITY.md`.
 - **Ideas:** open an issue first. A good idea may be built by the maintainer.
@@ -24,3 +24,9 @@ not evidence: the gate that counts is the run on `main` after the merge. Read th
 `.github/` and `.githooks/`: changes to those paths need the owner's review. Dependabot PRs come from the same repo but receive no
 Actions secret, so the full gate fails with a blank term list. Rerun or merge them after the gate passes on `main`,
 or add `HARNESS_DENYLIST` as a Dependabot secret too.
+
+For a release while the repository is private, first pass the full package gate and tests on the release
+commit. Run `npm pack --ignore-scripts` from a clean checkout, inspect and test that tarball, and publish
+that file with `npm publish <tarball> --ignore-scripts --access public`. Verify the registry version and
+tarball integrity afterward. The tag workflow's provenance publish is available only with a public source
+repository. If a shipped version must be withdrawn, deprecate it on npm and ship a corrected patch.

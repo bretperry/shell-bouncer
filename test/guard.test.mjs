@@ -552,6 +552,8 @@ describe("freeze marker: no push to dev while a release PR is open", () => {
     writeFileSync(join(root, ".git", SHIP_FREEZE_FILE), "29\n");
     assert.equal(shipFreeze(join(root, "wt")), "29");
     assert.equal(shipFreeze(root), "29");
+    writeFileSync(join(root, ".git", SHIP_FREEZE_FILE), "9".repeat(4097));
+    assert.equal(shipFreeze(root), "");
   });
 });
 

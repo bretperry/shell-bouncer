@@ -218,8 +218,11 @@ const APPROVED_FAMILY_URL_FINGERPRINTS = new Set([
   "beec64797a22bc7526277c424f9b64cab463ede4900d81c747441891e7be7738",
   "2327d7b949aba0e9b0137cb1d16eeacda7fe8318d2a580d837d8f36d655161bf",
   "05bb3bfa6e84485ddfec76cb323053de1cc1cde64e516efd8657f7d60be08ca1",
+  "8d8684aadc7e69e62b1471bbe3921b48da22b858823e60b7bc087a8b9e97101e",
   "4f65d74bfe164aee7a8040b1c036dfefbcf62a56d858ccd042e267b10a627dbb",
+  "bf0040b72259d1c1bbbaf19fa6d55b3eb4166e4a7aa294f523d7d3bf118ac5ce",
   "6f6f75de36c714e4e8b6239d89bcbd2b1c0a2237e8a6761a3f695ce14eada72c",
+  "bce7bd24cc0350bbac6a5b995f3467a8531c8a639d00ac8a9dfdc31119e309b9",
 ]);
 const APPROVED_IDENTITY_EMAIL_FINGERPRINT = "edf66de584f8889227f518d4c4e2a20e679a40e77f401af4091956d7fc8dae53";
 const fingerprint = (text) => createHash("sha256").update(text, "utf8").digest("hex");

@@ -1,5 +1,5 @@
 {
-  "name": "bash-bouncer",
+  "name": "shell-bouncer",
   "version": "0.1.0",
   "description": "A command guard for coding agents: refuses or escalates shell commands that only a human should run.",
   "type": "module",
@@ -9,19 +9,22 @@
   "license": "FSL-1.1-MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bretperry/reins"
+    "url": "https://github.com/bretperry/shell-bouncer"
   },
   "exports": {
     ".": "./src/index.mjs",
     "./package.json": "./package.json"
   },
   "bin": {
+    "bouncer": "bin/reins.mjs",
     "reins": "bin/reins.mjs"
   },
   "files": [
     "bin/",
     "src/",
-    "sets/"
+    "sets/",
+    "SECURITY.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs"

@@ -10,7 +10,7 @@
 import "./tmpdir.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -123,6 +123,23 @@ describe("ask gate: the hook, `reins ask-gate`", () => {
     const root = project({ askTags: { tags: TAGS, log: "asks.jsonl" } });
     hook(root, JSON.stringify(ask("Push?", "[policy] Merge?")));
     const lines = readFileSync(join(root, "asks.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(lines.map(({ tag, question }) => ({ tag, question })), [{ tag: null, question: "Push?" }, { tag: "policy", question: "[policy] Merge?" }]);
+    assert.deepEqual(lines.map(({ at, ...entry }) => {
+      assert.ok(Number.isFinite(Date.parse(at)));
+      return entry;
+    }), [{ tag: null }, { tag: "policy" }]);
+    assert.equal(statSync(join(root, "asks.jsonl")).mode & 0o077, 0);
+  });
+
+  it("leaves a broadly readable log or linked target unchanged", () => {
+    const root = project({ askTags: { tags: TAGS, log: "asks.jsonl" } });
+    const log = join(root, "asks.jsonl");
+    writeFileSync(log, "existing", { mode: 0o644 });
+    assert.equal(hook(root, JSON.stringify(ask("[policy] Merge?"))).status, 0);
+    assert.equal(readFileSync(log, "utf8"), "existing");
+
+    const other = project({ askTags: { tags: TAGS, log: "link/asks.jsonl" } });
+    symlinkSync(root, join(other, "link"), "dir");
+    assert.equal(hook(other, JSON.stringify(ask("[policy] Merge?"))).status, 0);
+    assert.equal(readFileSync(log, "utf8"), "existing");
   });
 });

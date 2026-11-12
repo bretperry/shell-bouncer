@@ -25,7 +25,7 @@ const off = ["REINS", "WHIPPLETREE_GUARD"].some((name) => process.env[name] === 
 // Says why the command is blocked: Cursor reads a JSON answer, Claude Code reads stderr with exit 2.
 // Each write may fail (a closed pipe); the exit code still blocks.
 const blocked = (why) => {
-  const message = `reins: ${why}, so this command is blocked. Tell the user: fix it (reinstall the package), or set REINS=off in the shell that starts the agent.`;
+  const message = `bouncer: ${why}, so this command is blocked. Tell the user: fix it (reinstall the package), or set REINS=off in the shell that starts the agent.`;
   if (cursor) {
     try {
       writeSync(1, JSON.stringify({ permission: "deny", user_message: message, agent_message: message }));
@@ -62,7 +62,7 @@ try {
     process.exit(2);
   }
   try {
-    writeSync(2, `reins: ${message}\n`);
+    writeSync(2, `bouncer: ${message}\n`);
   } catch {
     // Nowhere left to say it.
   }

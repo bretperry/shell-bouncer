@@ -1,4 +1,4 @@
-// The package's public surface: `import { evaluate, loadRules, main, askGate } from "reins"`.
+// The package's public surface: `import { evaluate, loadRules, main, askGate } from "shell-bouncer"`.
 // In the app: nothing at runtime; a caller (a project's own hook adapter) imports it.
 // Used by: package.json "exports"; tested by test/*.test.mjs.
 // Uses: src/guard.mjs (the guard), src/ask-gate.mjs (the ask gate, as `askGate`).

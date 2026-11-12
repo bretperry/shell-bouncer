@@ -5,7 +5,7 @@
 // Run: not by hand. Claude Code pipes each matching tool call to `reins ask-gate`.
 // When: before a tool that asks the user something. A question in plain chat text doesn't pass through it.
 // Env: REINS_ASK_GATE or WHIPPLETREE_ASK_GATE (`off` and `log` both record and allow; default enforces; `offEnv` replaces the names); CLAUDE_PROJECT_DIR (the project root, when the caller names none).
-// Writes: one line per question to askTags.log when set (time, project, tag, question), so the count can be watched.
+// Writes: one line per question to askTags.log when set (time and tag), so the count can be watched.
 // Exit: 0 allowed; 2 refused, with the reason on stderr for the agent.
 //
 // Off by default: with no `askTags` (the config's, or the caller's `tags`), every question passes.
@@ -15,9 +15,9 @@
 // a bad pattern shows up. It fails open: unreadable input, or a config that doesn't load, lets the
 // question through, since a gate that wedges an agent's every question costs more than one untagged ask.
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { DEFAULT_FILES, loadRules } from "./guard.mjs";
 
@@ -63,13 +63,27 @@ export const judge = (payload, { mode, tags = [], offEnv = DEFAULT_OFF_ENV, tool
 };
 
 // The log is a convenience: failing to write it never blocks a question or an agent.
-const appendRecord = (log, cwd, entry) => {
+const appendRecord = (path, root, tag) => {
+  let fd;
   try {
-    const path = log.startsWith("~/") ? join(homedir(), log.slice(2)) : log;
-    mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), project: basename(cwd), ...entry })}\n`, { mode: 0o600 });
+    const dir = dirname(path);
+    // Project configuration may only write into an existing directory within the project.
+    if (root === null) mkdirSync(dir, { recursive: true });
+    const parent = realpathSync(dir);
+    if (root !== null) {
+      const fromRoot = relative(realpathSync(root), parent);
+      if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) return;
+    }
+    fd = openSync(join(parent, basename(path)), constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0) return;
+    writeFileSync(fd, `${JSON.stringify({ at: new Date().toISOString(), tag })}\n`);
   } catch {
-    // Nothing to do: see above.
+    // Logging never blocks a question.
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* Best effort. */ }
+    }
   }
 };
 
@@ -94,9 +108,8 @@ export const run = ({ root, files = {}, askTags, offEnv = DEFAULT_OFF_ENV, input
     settings = rules.error === "" ? rules.askTags : null;
   }
   if (settings === null) return 0;
-  const cwd = String(payload?.cwd ?? process.cwd());
-  const log = typeof settings.log === "string" && settings.log !== "" ? (settings.log.startsWith("~/") || settings.log.startsWith("/") ? settings.log : join(where, settings.log)) : null;
-  const result = judge(payload, { tags: settings.tags, tools: settings.tools ?? null, refusal: settings.refusal, offEnv, record: log === null ? () => {} : (entry) => appendRecord(log, cwd, entry) });
+  const log = typeof settings.log === "string" && settings.log !== "" ? (settings.log.startsWith("~/") ? join(homedir(), settings.log.slice(2)) : resolve(where, settings.log)) : null;
+  const result = judge(payload, { tags: settings.tags, tools: settings.tools ?? null, refusal: settings.refusal, offEnv, record: log === null ? () => {} : ({ tag }) => appendRecord(log, askTags == null ? where : null, tag) });
   if (result.code !== 0) process.stderr.write(`${result.reason}\n`);
   return result.code;
 };

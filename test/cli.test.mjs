@@ -45,6 +45,15 @@ describe("reins CLI", () => {
     assert.match(broken.stdout, /^verdict: deny$/m);
   });
 
+  it("explain uses the explicit root for rules and package scripts", () => {
+    const project = mkdtempSync(join(tmpdir(), "bouncer-explain-"));
+    writeFileSync(join(project, "package.json"), JSON.stringify({ scripts: { release: "git push -f origin main" } }));
+    const out = cli(["explain", "--root", project, "npm run release"]);
+    assert.equal(out.status, 0);
+    assert.match(out.stdout, /^verdict: (ask|deny)$/m);
+    assert.match(cli(["explain", "git status", "--root"]).stderr, /--root needs a directory/);
+  });
+
   it("explain with no command prints its usage", () => assert.equal(cli(["explain"]).status, 1));
 
   it("sets lists every bundled set and what it holds", () => {
@@ -56,7 +65,7 @@ describe("reins CLI", () => {
 
   it("help, and an unknown command", () => {
     assert.equal(cli(["help"]).status, 0);
-    assert.match(cli(["help"]).stdout, /reins explain/);
+    assert.match(cli(["help"]).stdout, /bouncer explain/);
     const unknown = cli(["frobnicate"]);
     assert.equal(unknown.status, 1);
     assert.match(unknown.stderr, /unknown command "frobnicate"/);
@@ -66,15 +75,15 @@ describe("reins CLI", () => {
 });
 
 describe("the package's shape", () => {
-  it("names one bin, reins, and the exports resolve", () => {
-    assert.deepEqual(PKG.bin, { reins: "bin/reins.mjs" });
+  it("installs bouncer and keeps the reins alias", () => {
+    assert.deepEqual(PKG.bin, { bouncer: "bin/reins.mjs", reins: "bin/reins.mjs" });
     assert.equal(PKG.license, "FSL-1.1-MIT");
     assert.equal(PKG.engines.node, ">=22");
     assert.equal(PKG.dependencies, undefined);
     assert.equal(PKG.devDependencies, undefined);
     assert.equal(reins.PACKAGE_NAME, PKG.name);
     // The guard protects node_modules/.bin/<BIN_NAME>, so the bin must carry that name.
-    assert.deepEqual(Object.keys(PKG.bin), [reins.BIN_NAME]);
+    assert.equal(reins.BIN_NAME, "bouncer");
   });
 
   it("exports the API's names", () => {

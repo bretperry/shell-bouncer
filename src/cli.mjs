@@ -15,21 +15,24 @@ import { fileURLToPath } from "node:url";
 // answer-or-block wrapper, not at load; the ask gate loads only for its own command.
 import * as guard from "./guard.mjs";
 
-const HELP = `reins: stops a coding agent's risky shell commands.
+const HELP = `bouncer: stops a coding agent's risky shell commands.
 
-  reins hook claude|cursor   the hook entry: hook JSON on stdin; exit 0 answered, 2 blocked
-  reins ask-gate             the ask gate's hook entry (off unless reins.json sets askTags)
-  reins explain "<command>"  prints the verdict and the rule that gave it; runs nothing
-  reins sets                 lists the bundled rule sets and what each adds
-  reins help                 this text
+  bouncer hook claude|cursor   the hook entry: hook JSON on stdin; exit 0 answered, 2 blocked
+  bouncer ask-gate             the ask gate's hook entry (off unless reins.json sets askTags)
+  bouncer explain [--root <dir>] "<command>"
+                             prints the verdict and the rule that gave it; runs nothing
+  bouncer sets                 lists the bundled rule sets and what each adds
+  bouncer --version            prints the package version
+  bouncer help                 this text
 
-The config is reins.json at the project root (CLAUDE_PROJECT_DIR, else the current folder).
+The config is reins.json at the project root (CLAUDE_PROJECT_DIR, CURSOR_PROJECT_DIR, or the current folder).
 REINS=off turns the guard off for a session.`;
 
 // The project root for a person's command: `--root <dir>` among the arguments, else the hook's.
 const rootArg = (args) => {
   const at = args.indexOf("--root");
   if (at === -1) return { root: undefined, args };
+  if (!args[at + 1] || args[at + 1].startsWith("--")) throw new Error("--root needs a directory");
   return { root: args[at + 1], args: [...args.slice(0, at), ...args.slice(at + 2)] };
 };
 
@@ -39,14 +42,18 @@ const explain = (args) => {
   const { root, args: rest } = rootArg(args);
   const command = rest.join(" ");
   if (command.trim() === "") {
-    process.stdout.write('Usage: reins explain "<command>" [--root <dir>]\n');
+    process.stdout.write('Usage: bouncer explain "<command>" [--root <dir>]\n');
     return 1;
   }
-  const where = root ?? process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd();
+  const where = guard.rootOf(root);
+  if (guard.guardOff()) {
+    process.stdout.write("verdict: allow (guard disabled)\n");
+    return 0;
+  }
   const rules = guard.loadRules(where);
   const sets = rules.loaded?.length ? rules.loaded.join(", ") : "none";
-  const verdict = guard.hookVerdict(command, process.cwd(), { root: where });
-  const lines = [`command: ${command}`, `rule sets: ${rules.error === "" ? sets : "(the config didn't load)"}`];
+  const verdict = guard.hookVerdict(command, root ?? process.cwd(), { root: where });
+  const lines = [`rule sets: ${rules.error === "" ? sets : "(the config didn't load)"}`];
   lines.push(verdict === null ? "verdict: allow (no rule fired)" : `verdict: ${verdict.decision}`);
   if (verdict !== null) lines.push(`reason: ${verdict.reason}`);
   process.stdout.write(`${lines.join("\n")}\n`);
@@ -85,7 +92,7 @@ export const cli = async (command, args) => {
     case "hook": {
       const host = args[0];
       if (host !== "claude" && host !== "cursor") {
-        process.stderr.write("reins hook: name the host, claude or cursor\n");
+        process.stderr.write("bouncer hook: name the host, claude or cursor\n");
         return 2;
       }
       guard.main({ host });
@@ -97,13 +104,19 @@ export const cli = async (command, args) => {
       return explain(args);
     case "sets":
       return listSets();
+    case "--version":
+    case "-v": {
+      const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+      process.stdout.write(`${version}\n`);
+      return 0;
+    }
     case "help":
     case "--help":
     case "-h":
       process.stdout.write(`${HELP}\n`);
       return 0;
     default:
-      process.stderr.write(`reins: unknown command ${JSON.stringify(command)}\n\n${HELP}\n`);
+      process.stderr.write(`bouncer: unknown command ${JSON.stringify(command)}\n\n${HELP}\n`);
       return 1;
   }
 };

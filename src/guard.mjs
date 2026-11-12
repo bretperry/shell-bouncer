@@ -72,7 +72,7 @@
 
 // Node builtins only, so the hook runs before `pnpm install`.
 import { execFileSync } from "node:child_process";
-import { lstatSync, opendirSync, readdirSync, readFileSync, realpathSync, statSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, opendirSync, readdirSync, readFileSync, realpathSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,10 +86,11 @@ import { runInNewContext } from "node:vm";
 //   may carry it). None by default.
 // A key not listed here is an error, so a misspelt one can't drop a file silently.
 // The package's npm name: the one place the code names it (the guard's own package, its install
-// folder). It must equal package.json's "name"; test/package.test.mjs checks that.
-export const PACKAGE_NAME = "bash-bouncer";
+// folder). It must equal package.json's "name"; test/cli.test.mjs checks that.
+export const PACKAGE_NAME = "shell-bouncer";
 // The command the package installs (package.json `bin`); the guard protects its link in node_modules/.bin.
-export const BIN_NAME = "reins";
+export const BIN_NAME = "bouncer";
+const BIN_NAMES = [BIN_NAME, "reins"];
 
 export const DEFAULT_FILES = Object.freeze({ config: "reins.json", ruleDir: null, branches: null });
 
@@ -420,20 +421,36 @@ const currentBranch = (dir) => {
   }
 };
 
-// The freeze marker's text in `dir`'s clone (trimmed; "" when empty), or null when there is none
+// The freeze marker's text in `dir`'s clone (trimmed; "" when empty or unreadable), or null when there is none
 // or git can't say where the clone's git dir is. `file` is the marker's name (a set's `freezeMarkers`).
 export const shipFreeze = (dir, file) => {
   if (typeof file !== "string" || file === "") return null;
+  let common;
   try {
-    const common = execFileSync("git", ["-C", dir, "rev-parse", "--git-common-dir"], {
+    common = execFileSync("git", ["-C", dir, "rev-parse", "--git-common-dir"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: GIT_LOOKUP_MS,
       killSignal: "SIGKILL",
     }).trim();
-    return readFileSync(resolve(dir, common, file), "utf8").trim();
   } catch {
     return null;
+  }
+  if (common === "") return null;
+  let fd;
+  try {
+    fd = openSync(resolve(dir, common, file), constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    const marker = fstatSync(fd);
+    if (!marker.isFile() || marker.size > 4096) return "";
+    const buffer = Buffer.alloc(4097);
+    const length = readSync(fd, buffer);
+    return length > 4096 ? "" : buffer.toString("utf8", 0, length).trim();
+  } catch (error) {
+    return error?.code === "ENOENT" ? null : "";
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* Keep the marker verdict. */ }
+    }
   }
 };
 
@@ -1526,7 +1543,7 @@ const evaluateLine = (command, options) => {
       if (target.argv === undefined || programName(target.argv[0]?.value ?? "") !== "find") continue;
       for (const line of findExecs(target.argv)) {
         const inner = nested(line, inline, { lost: true, wrapped: true });
-        if (inner) verdicts.push(ask(`\`find -exec\` runs \`${line}\` for each file it finds, and the guard would stop that command on its own (${inner.reason}); the user confirms.`));
+        if (inner) verdicts.push(ask(`\`find -exec\` runs a command for each file it finds, and the guard would stop that command on its own (${inner.reason}); the user confirms.`));
       }
     }
     // `ssh h psql …`, `kubectl exec p -- psql …`, `watch psql …`: a line run behind a wrapper the
@@ -2440,7 +2457,7 @@ const markerWrites = (list, markerFiles = []) => {
 // The installed package is more than `node_modules/<pkg>/`: the command its hook runs
 // (`node_modules/.bin/<bin>`, a symlink or a shim script, `.cmd` and `.ps1` on Windows), and the
 // package managers' stores, where the files really live (STORES).
-const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`, ...["", ".cmd", ".ps1"].map((ext) => `node_modules/.bin/${BIN_NAME}${ext}`)];
+const HOOK_FILES = [".claude/settings.json", ".claude/settings.local.json", ".cursor/hooks.json", `node_modules/${PACKAGE_NAME}/`, ...BIN_NAMES.flatMap((bin) => ["", ".cmd", ".ps1"].map((ext) => `node_modules/.bin/${bin}${ext}`))];
 
 // The stores that hold the installed package in a folder named for its version: pnpm's
 // `node_modules/.pnpm/<pkg>@<version>/`, bun's `node_modules/.bun/<pkg>@<version>/` (a scope's `/`
@@ -4494,7 +4511,7 @@ const ruleVerdict = (make, rule) => {
 
 // Why every command is refused when a rule file, pack, or set doesn't load, naming it. `off` is the
 // off switch's name (the first of `offEnv`), so the message names one that works for this caller.
-const loadError = (file, error, off = DEFAULT_OFF_ENV[0]) => `${file} didn't load (${error instanceof Error ? error.message : String(error)}), so every shell command is refused. Stop and tell the user: they fix the file or set ${off}=off. Don't edit guard rules to get a command through.`;
+const loadError = (file, error, off = DEFAULT_OFF_ENV[0]) => `${file} didn't load (${error instanceof SyntaxError ? "invalid JSON" : error instanceof Error ? error.message : String(error)}), so every shell command is refused. Stop and tell the user: they fix the file or set ${off}=off. Don't edit guard rules to get a command through.`;
 
 // The `files` option checked against DEFAULT_FILES: each key known, each value a relative path or
 // null. Throws naming the key, so a misspelt one refuses every command instead of dropping a file.
@@ -4985,7 +5002,7 @@ const pattern = (source, flags, at) => {
 const hostOf = (value) => (value === "cursor" ? "cursor" : "claude");
 
 // The human's off switch, for a session where the guard is in the way: any `offEnv` name set to `off`.
-const guardOff = (offEnv = DEFAULT_OFF_ENV) => offEnv.some((name) => process.env[name] === "off");
+export const guardOff = (offEnv = DEFAULT_OFF_ENV) => offEnv.some((name) => process.env[name] === "off");
 
 // The ask the watchdog gives when no verdict came in time.
 const watchdogAsk = () => ask(`The guard didn't reach a verdict within its ${WATCHDOG_MS} ms watchdog, so it stopped reading; the user confirms this command. Tell the user if this repeats: something in the guard is slow.`);
@@ -4993,7 +5010,7 @@ const watchdogAsk = () => ask(`The guard didn't reach a verdict within its ${WAT
 // The project root a hook reads its config from: the caller's `root`, else the project folder the
 // host exports to hook processes (CLAUDE_PROJECT_DIR, CURSOR_PROJECT_DIR), else the hook's own cwd.
 // Never the payload's cwd, which moves with the agent.
-const rootOf = (root) => root ?? process.env["CLAUDE_PROJECT_DIR"] ?? process.env["CURSOR_PROJECT_DIR"] ?? process.cwd();
+export const rootOf = (root) => root ?? process.env["CLAUDE_PROJECT_DIR"] ?? process.env["CURSOR_PROJECT_DIR"] ?? process.cwd();
 
 // Hook entry point: stdin JSON in, host-specific JSON out, always within WATCHDOG_MS.
 // Options: `host` ("claude" or "cursor"; default argv[2]), `root`, `files`, `sets` (loadRules()),
@@ -5047,7 +5064,13 @@ export const main = ({ host = hostOf(process.argv[2]), root, files, sets, offEnv
   process.stdin.on("end", () => {
     try {
       // Claude sends { tool_input: { command }, cwd }; Cursor sends { command, cwd }.
-      const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      let input;
+      try {
+        input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        failed(new Error("invalid hook JSON"));
+        return;
+      }
       const raw = input?.tool_input?.command ?? input?.command;
       const cwd = String(input?.cwd ?? process.cwd());
       if (off()) {
