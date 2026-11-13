@@ -1,8 +1,8 @@
-// The `reins` command's subcommands, after bin/reins.mjs has loaded this module.
+// Shell Bouncer's subcommands, after bin/reins.mjs has loaded this module.
 // In the app: nothing at runtime; bin/reins.mjs calls cli() with the subcommand and its arguments.
 // Used by: bin/reins.mjs; tested by test/cli.test.mjs.
 // Uses: src/guard.mjs (main, hookVerdict, loadRules), src/ask-gate.mjs (run, loaded only for `ask-gate`), the bundled sets in sets/.
-// Run: through bin/reins.mjs: `reins hook claude|cursor`, `reins ask-gate`, `reins explain "<command>"`, `reins sets`, `reins help`.
+// Run: through bin/reins.mjs: `bouncer hook claude|cursor`, `bouncer ask-gate`, `bouncer explain "<command>"`, `bouncer sets`, `bouncer help`.
 // When: hook entries before every agent command or question; `explain` and `sets` by hand.
 // Env: as src/guard.mjs and src/ask-gate.mjs read them; CLAUDE_PROJECT_DIR or CURSOR_PROJECT_DIR (the project root).
 // Writes: stdout (an answer or a report); nothing on disk except the ask gate's optional log.
@@ -15,7 +15,9 @@ import { fileURLToPath } from "node:url";
 // answer-or-block wrapper, not at load; the ask gate loads only for its own command.
 import * as guard from "./guard.mjs";
 
-const HELP = `bouncer: stops a coding agent's risky shell commands.
+const HELP = `Shell Bouncer checks a coding agent's shell commands.
+
+Commands: bouncer, shell-bouncer, reins.
 
   bouncer hook claude|cursor   the hook entry: hook JSON on stdin; exit 0 answered, 2 blocked
   bouncer ask-gate             the ask gate's hook entry (off unless reins.json sets askTags)
@@ -36,7 +38,7 @@ const rootArg = (args) => {
   return { root: args[at + 1], args: [...args.slice(0, at), ...args.slice(at + 2)] };
 };
 
-// `reins explain "<command>"`: the verdict the hook would give in this folder, and its reason
+// `bouncer explain "<command>"`: the verdict the hook would give in this folder, and its reason
 // (a rule file's reason names the file). Reads the same config the hook reads.
 const explain = (args) => {
   const { root, args: rest } = rootArg(args);
@@ -60,10 +62,10 @@ const explain = (args) => {
   return rules.error === "" ? 0 : 1;
 };
 
-// The kinds of rule one set file adds, counted, for `reins sets`.
+// The kinds of rule one set file adds, counted, for `bouncer sets`.
 const KINDS = { deny: "deny rows", ask: "ask rows", protectedBranches: "protected branches", workflowOnlyBranches: "workflow-only branches", statusContexts: "status contexts", repoVariables: "repository variables", markerFiles: "marker files", freezeMarkers: "freeze markers", skipCi: "a skip-CI rule", pushEnvDeny: "push variables", gitConfigAsk: "git settings", guardFiles: "guard files" };
 
-// `reins sets`: each bundled set, what it holds, and its own description.
+// `bouncer sets`: each bundled set, what it holds, and its own description.
 const listSets = () => {
   const dir = fileURLToPath(new URL("../sets/", import.meta.url));
   const present = new Set(readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -5)));

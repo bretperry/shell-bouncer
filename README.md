@@ -12,7 +12,7 @@ bouncer --version
 bouncer explain 'git status'
 ```
 
-The package installs the `bouncer` command. Existing hooks can still use the `reins` alias.
+Use `bouncer` or `shell-bouncer`. Existing hooks can keep using `reins`. All three commands behave the same way.
 
 ## Connect your agent
 
@@ -48,7 +48,7 @@ Merge the appropriate example into your existing settings. Install Bouncer in th
 
 ## Project rules
 
-No configuration is required for the built-in policy. To add a protected branch or enable an optional workflow set, create `reins.json` in your project root:
+No configuration is required for the built-in policy. Shell Bouncer keeps the existing configuration filename, `reins.json`, for compatibility. To add a protected branch or enable an optional workflow set, create `reins.json` in your project root:
 
 ```json
 {

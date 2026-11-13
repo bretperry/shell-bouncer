@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Add `shell-bouncer` as a CLI alias alongside `bouncer` and `reins`.
+- Use Shell Bouncer as the product name throughout the documentation.
+
 ## 0.1.0
 
 - Initial npm release as `shell-bouncer`. Use `bouncer` for new hook setups; `reins` remains an alias.

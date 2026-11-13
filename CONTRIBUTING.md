@@ -1,6 +1,6 @@
 # Contributing
 
-`reins` is source-available (see `LICENSE`), and **outside pull requests are not accepted yet**.
+Shell Bouncer is source-available (see `LICENSE`), and **outside pull requests are not accepted yet**.
 The maintainer needs a contributor agreement in place before merging code from anyone else, so the
 project can still be relicensed. Until that exists, a pull request from outside will be closed unread.
 

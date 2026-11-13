@@ -103,6 +103,7 @@ describe("the core alone: a bare repo with no reins.json", () => {
     [`echo x > node_modules/.bin/${BIN_NAME}`, "ask"],
     [`rm node_modules/.bin/${BIN_NAME}.cmd`, "ask"],
     ["rm node_modules/.bin/reins", "ask"],
+    ["rm node_modules/.bin/shell-bouncer", "ask"],
     ["rm -rf node_modules/.pnpm", "ask"],
     [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@0.1.0`, "ask"],
     [`rm -rf node_modules/.pnpm/${PACKAGE_NAME}@*`, "ask"],

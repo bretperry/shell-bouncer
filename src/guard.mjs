@@ -90,7 +90,7 @@ import { runInNewContext } from "node:vm";
 export const PACKAGE_NAME = "shell-bouncer";
 // The command the package installs (package.json `bin`); the guard protects its link in node_modules/.bin.
 export const BIN_NAME = "bouncer";
-const BIN_NAMES = [BIN_NAME, "reins"];
+const BIN_NAMES = [BIN_NAME, PACKAGE_NAME, "reins"];
 
 export const DEFAULT_FILES = Object.freeze({ config: "reins.json", ruleDir: null, branches: null });
 

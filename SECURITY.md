@@ -18,5 +18,5 @@ Only the latest release of `shell-bouncer` gets fixes.
 
 ## Scope
 
-`reins` is source-available software under the Functional Source License (see `LICENSE`).
+Shell Bouncer is source-available software under the Functional Source License (see `LICENSE`).
 Bugs in your own configuration, or in tools it runs on your behalf, are outside its scope.

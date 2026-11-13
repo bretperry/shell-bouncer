@@ -1,6 +1,6 @@
 {
   "name": "shell-bouncer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A command guard for coding agents: refuses or escalates shell commands that only a human should run.",
   "type": "module",
   "engines": {
@@ -17,7 +17,8 @@
   },
   "bin": {
     "bouncer": "bin/reins.mjs",
-    "reins": "bin/reins.mjs"
+    "reins": "bin/reins.mjs",
+    "shell-bouncer": "bin/reins.mjs"
   },
   "files": [
     "bin/",
