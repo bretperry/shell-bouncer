@@ -48,7 +48,7 @@ Merge the appropriate example into your existing settings. Install Bouncer in th
 
 ## Project rules
 
-No configuration is required for the built-in policy. Shell Bouncer keeps the existing configuration filename, `reins.json`, for compatibility. To add a protected branch or enable an optional workflow set, create `reins.json` in your project root:
+No configuration is required for the built-in policy. To add a protected branch or enable an optional workflow set, create `shell-bouncer.json` in your project root:
 
 ```json
 {
@@ -56,6 +56,8 @@ No configuration is required for the built-in policy. Shell Bouncer keeps the ex
   "sets": ["draft-flow"]
 }
 ```
+
+Existing projects can rename `reins.json` to `shell-bouncer.json`. Shell Bouncer reads `reins.json` when the new file is absent.
 
 Run `bouncer sets` to see what the optional sets cover. Run `bouncer explain '<command>'` from the directory where the agent would run the command to see the verdict without executing it. Pass `--root <dir>` to use that directory for both configuration and evaluation.
 
@@ -65,6 +67,6 @@ Claude Code users can optionally configure `askTags` and wire `bouncer ask-gate`
 
 Bouncer is a guardrail for configured shell hooks. Keep your agent's sandbox, access controls, and repository protection in place. Commands outside those hooks are outside Bouncer's scope.
 
-Bouncer does not send telemetry. It reads the hook input and may inspect local project files such as `reins.json`, `.env`, or a referenced SQL file to decide what a command would do. Verdict reasons go back to the agent host. If you enable `askTags.log`, the local log records timestamps and matching tags, without question text. Choose a file inside an existing directory in the project, keep the log out of version control, and restrict it to your user.
+Bouncer does not send telemetry. It reads the hook input and may inspect local project files such as `shell-bouncer.json`, `.env`, or a referenced SQL file to decide what a command would do. Verdict reasons go back to the agent host. If you enable `askTags.log`, the local log records timestamps and matching tags, without question text. Choose a file inside an existing directory in the project, keep the log out of version control, and restrict it to your user.
 
-To stop using the guard, remove its hook entry before uninstalling the package. See [SECURITY.md](SECURITY.md) for reporting guidance. Shell Bouncer is source-available under the Functional Source License; see [LICENSE](LICENSE).
+To stop using the guard, remove its hook entry before uninstalling the package. See [SECURITY.md](SECURITY.md) for reporting guidance. Shell Bouncer is released under the [MIT License](LICENSE).

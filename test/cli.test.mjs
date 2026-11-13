@@ -77,7 +77,7 @@ describe("reins CLI", () => {
 describe("the package's shape", () => {
   it("installs bouncer, shell-bouncer, and reins", () => {
     assert.deepEqual(PKG.bin, { bouncer: "bin/reins.mjs", reins: "bin/reins.mjs", "shell-bouncer": "bin/reins.mjs" });
-    assert.equal(PKG.license, "FSL-1.1-MIT");
+    assert.equal(PKG.license, "MIT");
     assert.equal(PKG.engines.node, ">=22");
     assert.equal(PKG.dependencies, undefined);
     assert.equal(PKG.devDependencies, undefined);

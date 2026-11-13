@@ -1,10 +1,10 @@
 // Refuses or escalates agent shell commands that only a human should run: the guard's core.
 // In the app: nothing at runtime; a coding agent's pre-command hook (Claude Code PreToolUse on Bash, Cursor beforeShellExecution) runs it before every agent command, through bin/reins.mjs.
 // Used by: bin/reins.mjs (`reins hook`, `reins explain`, `reins sets`), and any caller that imports the package; tested by test/*.test.mjs.
-// Uses: git (the branch where each commit or push runs); .env, package.json, Prisma config, and SQL files a database command reads; the rule sets named (sets/*.json, each must load); the project's reins.json, its rule folder, and its branch file when present (`files`).
+// Uses: git (the branch where each commit or push runs); .env, package.json, Prisma config, and SQL files a database command reads; the rule sets named (sets/*.json, each must load); the project's shell-bouncer.json, its rule folder, and its branch file when present (`files`).
 // Run: `reins hook claude` or `reins hook cursor`, from the agent's hook; a hook payload on stdin. The old entry, `node <this file> claude|cursor`, runs the same hook.
 // When: before every agent shell command runs; not for a person's own shell, and not a substitute for the rules it enforces.
-// Env: REINS or WHIPPLETREE_GUARD (`off`: no verdict, so the command runs as it would with no guard; `offEnv` replaces the names); CLAUDE_PROJECT_DIR or CURSOR_PROJECT_DIR (the project root, when the caller names none); a database URL variable a command names, read from this process's environment, then the repo's .env.
+// Env: SHELL_BOUNCER, REINS, or WHIPPLETREE_GUARD (`off`: no verdict, so the command runs as it would with no guard; `offEnv` replaces the names); CLAUDE_PROJECT_DIR or CURSOR_PROJECT_DIR (the project root, when the caller names none); a database URL variable a command names, read from this process's environment, then the repo's .env.
 // Writes: nothing (read-only): `git rev-parse --abbrev-ref HEAD` (and `--git-common-dir` for a push) in the command's directory, and the rule and config files named in Uses, plus a freeze marker a set names; the verdict JSON on stdout.
 // Exit: 0 answered; the verdict is JSON on stdout (deny, ask, or none, which Claude reads as no opinion); a crash or the 3 s watchdog answers ask. Run as a script (the old entry): 2 blocked, as `reins hook` blocks.
 //
@@ -12,7 +12,7 @@
 // memory test. "deny" is for acts no session may take (flipping a ready PR back to draft,
 // force-pushing or deleting a protected branch, deleting data). "ask" is for acts that are fine with the user's OK in the
 // moment (marking a PR ready, merging, shipping main, a manual workflow run): the user sees the prompt and decides.
-// Fails closed to ask (crash, size or time budget, watchdog); details at main(). Off switch: REINS=off.
+// Fails closed to ask (crash, size or time budget, watchdog); details at main(). Off switch: SHELL_BOUNCER=off.
 //
 // The full list, so no agent reads the body to learn it (project and pack rule files add their own).
 // The rules that belong to one team's workflow (its branches and switches, a merge conveyor, a draft
@@ -34,7 +34,7 @@
 //   drop, rollback, or dev migrate against one; `dropdb`; Neon, Turso, PlanetScale, Cloudflare
 //   D1/R2/KV deletes; cloud CLI deletes (aws, gcloud, az, gsutil, …); `terraform|tofu apply|destroy`,
 //   Terraform state rm/push/migrate; `cdk|cdktf deploy|destroy|…`. A data deny can be lifted for an
-//   exact command in the project's reins.json (`allow`).
+//   exact command in the project's shell-bouncer.json (`allow`).
 // - deny, any line: a rule file that is present but doesn't load.
 // - ask: `gh pr ready`, `gh pr merge` (and its GraphQL/API forms);
 //   pushing or moving main or master (`askOnPush`); `gh workflow run` or a dispatch; changing branch protection or
@@ -62,7 +62,7 @@
 // (FLOOR_*), so the per-client reading can only tighten a verdict.
 //
 // The built-in git and GitHub acts are a table (POLICY) in a project rule's shape. A project's own
-// rules live in its reins.json (deny, ask, and exact-command exemptions from a data-delete deny),
+// rules live in its shell-bouncer.json (deny, ask, and exact-command exemptions from a data-delete deny),
 // a pack's in the config's rule folder (`ruleDir`, deny and ask), and the branches no agent
 // rewrites in the config's protectedBranches. A caller may rename those files (`files`). A rule
 // file that is present but doesn't load fails closed: every command is refused, naming the file,
@@ -79,7 +79,7 @@ import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 
 // The files the guard reads from the project root (`files`; a caller may rename any of them):
-// - `config`: the project's config and its own rules (reins.json; CONFIG_KEYS). Absent: the core alone.
+// - `config`: the project's rules. Defaults to shell-bouncer.json, then reins.json when absent.
 // - `ruleDir`: a folder of pack rule files (*.json, deny and ask, name order). None by default; the
 //   config's `ruleDir` names one too. Absent folder: nothing added.
 // - `branches`: a file whose `protectedBranches` key alone is the guard's (another tool's config file
@@ -92,9 +92,10 @@ export const PACKAGE_NAME = "shell-bouncer";
 export const BIN_NAME = "bouncer";
 const BIN_NAMES = [BIN_NAME, PACKAGE_NAME, "reins"];
 
-export const DEFAULT_FILES = Object.freeze({ config: "reins.json", ruleDir: null, branches: null });
+const LEGACY_CONFIG = "reins.json";
+export const DEFAULT_FILES = Object.freeze({ config: "shell-bouncer.json", ruleDir: null, branches: null });
 
-// The keys reins.json may hold. `sets` names bundled sets; `deny`, `ask`, and `allow` are the
+// The keys shell-bouncer.json may hold. `sets` names bundled sets; `deny`, `ask`, and `allow` are the
 // project's own rules, as a project rule file holds them; the rest are knobs (loadRules()).
 const CONFIG_KEYS = ["$comment", "sets", "ruleDir", "protectedBranches", "askOnPush", "askTags", "deny", "ask", "allow"];
 
@@ -107,8 +108,8 @@ const SET_DIR = "sets";
 export const BUNDLED_SETS = Object.freeze(["draft-flow", "merge-conveyor", "ci-minutes", "chute-boss"]);
 
 // The off switch: any of these set to `off` turns the guard off (`offEnv` replaces the list). The
-// second is the name the guard had before it was a package, still read.
-export const DEFAULT_OFF_ENV = Object.freeze(["REINS", "WHIPPLETREE_GUARD"]);
+// last two names are supported for existing installations.
+export const DEFAULT_OFF_ENV = Object.freeze(["SHELL_BOUNCER", "REINS", "WHIPPLETREE_GUARD"]);
 
 // Unix-socket directories that are this machine's Postgres or MySQL. Any other path is not: `/cloudsql/…`
 // is the Cloud SQL proxy's socket for a production database.
@@ -2505,7 +2506,7 @@ const compileGuard = (paths) => {
 // The core's guard files with nothing configured: the default config file and the hook configs.
 let defaultGuardFiles = null;
 const defaultGuard = () => {
-  defaultGuardFiles ??= compileGuard([DEFAULT_FILES.config, ...HOOK_FILES, ...STORE_FILES]);
+  defaultGuardFiles ??= compileGuard([DEFAULT_FILES.config, LEGACY_CONFIG, ...HOOK_FILES, ...STORE_FILES]);
   return defaultGuardFiles;
 };
 
@@ -2608,7 +2609,7 @@ const couldBeGuardFile = (path, guard) => {
     const raw = word.split("/").filter((segment) => segment !== "");
     const segments = raw.map(globSegment);
     const rooted = !isAbsolute(word) && !word.startsWith("~") && !word.startsWith("..");
-    // Outside the repo root, a root-level name (reins.json) needs 3 literal characters
+    // Outside the repo root, a root-level name (shell-bouncer.json) needs 3 literal characters
     // besides `.json` in its glob, so `rm /tmp/*.json` isn't asked about.
     const loose = !rooted && (raw.at(-1) ?? "").replace(/\.json$/i, "").replace(/\{[^{}]*\}|\[[^\]]*\]|[*?]/g, "").length < 3;
     return guard.files.some((file) => {
@@ -4567,7 +4568,7 @@ const configAskTags = (value) => {
 // The ask gate's settings (askTags): `tags` (the reasons a question may reach the user), and
 // optional `refusal` (the text an untagged question gets), `tools` (the tool names it judges; all
 // when absent), `log` (a JSONL file each question is recorded in; `~/` is the home folder; in
-// reins.json, only a path inside the project: configAskTags()).
+// shell-bouncer.json, only a path inside the project: configAskTags()).
 export const askTagsOf = (value) => {
   if (!isRecord(value)) throw new Error('"askTags" must be an object');
   onlyKeys(value, ["tags", "refusal", "tools", "log"], "askTags");
@@ -4578,7 +4579,7 @@ export const askTagsOf = (value) => {
   return { tags, refusal: optional(value, "refusal", "askTags"), tools, log: optional(value, "log", "askTags") };
 };
 
-// Loads, from the project root: the config (`files.config`, reins.json), the rule sets it or the
+// Loads, from the project root: the config (`files.config`, shell-bouncer.json), the rule sets it or the
 // caller names (`sets`; the caller's list wins; none by default), the protected branches, then the
 // pack files (`ruleDir`, name order). Never throws: an absent config or pack file adds nothing, and
 // a file that is present but broken, a set that doesn't load, or an unknown `files` key comes back
@@ -4591,14 +4592,22 @@ export const loadRules = (root, { files = {}, sets: names, offEnv = DEFAULT_OFF_
   try {
     const paths = filesOf(files);
     file = paths.config ?? "the config";
-    const configText = paths.config === null ? null : readRuleFile(join(root, paths.config), root);
+    const defaultConfig = !Object.hasOwn(files, "config") || paths.config === DEFAULT_FILES.config;
+    let configText = paths.config === null ? null : readRuleFile(join(root, paths.config), root);
+    if (configText === null && defaultConfig) {
+      file = LEGACY_CONFIG;
+      configText = readRuleFile(join(root, LEGACY_CONFIG), root);
+      if (configText !== null) paths.config = LEGACY_CONFIG;
+    }
+    file = paths.config ?? "the config";
     const config = configText === null ? null : parseConfig(configText);
     const setNames = names ?? config?.sets ?? [];
     if (!Array.isArray(setNames)) throw new Error("the sets option must be an array");
     const sets = loadSets(setNames, off);
     if (sets.error !== "") return { ...NO_RULES, sets, loaded: [], askTags: null, error: sets.error };
     const ruleDir = config?.ruleDir ?? paths.ruleDir;
-    const guard = compileGuard([...[paths.config, paths.branches].filter((path) => path !== null), ...(ruleDir === null ? [] : [`${ruleDir}/`]), ...HOOK_FILES, ...STORE_FILES, ...sets.guardFiles]);
+    const configPaths = defaultConfig ? [DEFAULT_FILES.config, LEGACY_CONFIG] : [paths.config];
+    const guard = compileGuard([...[...configPaths, paths.branches].filter((path) => path !== null), ...(ruleDir === null ? [] : [`${ruleDir}/`]), ...HOOK_FILES, ...STORE_FILES, ...sets.guardFiles]);
     let branches = sets.branches;
     if (config?.protectedBranches) branches = { ...branches, protected: new Set(config.protectedBranches) };
     if (config?.askOnPush) branches = { ...branches, askOnPush: new Set(config.askOnPush) };
@@ -5228,7 +5237,7 @@ const isScript = () => {
 if (isScript()) {
   const host = process.argv[2] ?? "claude";
   const block = (why) => {
-    const message = `reins: ${why}, so this command is blocked. Tell the user: point the hook at \`reins hook claude|cursor\`, or set REINS=off in the shell that starts the agent.`;
+    const message = `reins: ${why}, so this command is blocked. Tell the user: point the hook at \`bouncer hook claude|cursor\`, or set SHELL_BOUNCER=off in the shell that starts the agent.`;
     try {
       if (host === "cursor") writeSync(1, JSON.stringify({ permission: "deny", user_message: message, agent_message: message }));
       writeSync(2, `${message}\n`);

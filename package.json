@@ -6,7 +6,7 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "FSL-1.1-MIT",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/bretperry/shell-bouncer"

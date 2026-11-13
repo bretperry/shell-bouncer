@@ -1,8 +1,6 @@
 # Contributing
 
-Shell Bouncer is source-available (see `LICENSE`), and **outside pull requests are not accepted yet**.
-The maintainer needs a contributor agreement in place before merging code from anyone else, so the
-project can still be relicensed. Until that exists, a pull request from outside will be closed unread.
+Shell Bouncer is licensed under MIT (see `LICENSE`). The maintainer currently accepts bug reports and feature suggestions.
 
 What helps now:
 
@@ -10,8 +8,6 @@ What helps now:
   what you expected, and what happened.
 - **Security problems:** do not open an issue. Follow `SECURITY.md`.
 - **Ideas:** open an issue first. A good idea may be built by the maintainer.
-
-When a contributor agreement exists, this file will say how to sign it.
 
 Maintainers: the seeded checkout enables `.githooks/pre-push`. In a new clone, enable it with
 `git config core.hooksPath .githooks`. Install Node.js and gitleaks, and export `HARNESS_DENYLIST`

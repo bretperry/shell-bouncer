@@ -2,6 +2,9 @@
 
 ## 0.1.1
 
+- Switch to the MIT License.
+- Use `shell-bouncer.json` and `SHELL_BOUNCER` for new setups. Existing configuration and environment variables still work.
+
 - Add `shell-bouncer` as a CLI alias alongside `bouncer` and `reins`.
 - Use Shell Bouncer as the product name throughout the documentation.
 

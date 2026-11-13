@@ -1,8 +1,8 @@
 /*
-  The ask gate: the verdict for each kind of question, its settings in reins.json, and the real hook's exit code.
+  The ask gate: the verdict for each kind of question, its settings in shell-bouncer.json, and the real hook's exit code.
   In the app: nothing at runtime; runs in `node --test test/*.test.mjs`.
   Used by: node:test (`node --test`), with node:assert; no install needed.
-  Uses: src/ask-gate.mjs, bin/reins.mjs (`reins ask-gate`), a temp project with a reins.json.
+  Uses: src/ask-gate.mjs, bin/reins.mjs (`reins ask-gate`), a temp project with a shell-bouncer.json.
 
   The hook must never wedge an agent: bad input, a call with no question, and a project with no
   askTags all pass.
@@ -23,14 +23,14 @@ const TAGS = ["irreversible", "only-you", "policy"];
 const ask = (...questions) => ({ tool_input: { questions: questions.map((question) => ({ question })) } });
 const BIN = fileURLToPath(new URL("../bin/reins.mjs", import.meta.url));
 
-// A temp project root with this reins.json (none when `config` is undefined).
+// A temp project root with this shell-bouncer.json (none when `config` is undefined).
 const project = (config) => {
   const root = mkdtempSync(join(tmpdir(), "ask-gate-root-"));
-  if (config !== undefined) writeFileSync(join(root, "reins.json"), typeof config === "string" ? config : JSON.stringify(config));
+  if (config !== undefined) writeFileSync(join(root, "shell-bouncer.json"), typeof config === "string" ? config : JSON.stringify(config));
   return root;
 };
 const hook = (root, input, env = {}) =>
-  spawnSync("node", [BIN, "ask-gate"], { input, encoding: "utf8", env: { ...process.env, REINS_ASK_GATE: "", WHIPPLETREE_ASK_GATE: "", HOME: mkdtempSync(join(tmpdir(), "ask-gate-home-")), CLAUDE_PROJECT_DIR: root, ...env } });
+  spawnSync("node", [BIN, "ask-gate"], { input, encoding: "utf8", env: { ...process.env, SHELL_BOUNCER_ASK_GATE: "", REINS_ASK_GATE: "", WHIPPLETREE_ASK_GATE: "", HOME: mkdtempSync(join(tmpdir(), "ask-gate-home-")), CLAUDE_PROJECT_DIR: root, ...env } });
 
 describe("ask gate: judge()", () => {
   it("is exported as askGate from the package", () => assert.equal(askGate.judge, judge));
@@ -73,7 +73,7 @@ describe("ask gate: judge()", () => {
   });
 
   it("reads the mode from offEnv: REINS_ASK_GATE, and the old WHIPPLETREE_ASK_GATE", () => {
-    for (const name of ["REINS_ASK_GATE", "WHIPPLETREE_ASK_GATE"]) {
+    for (const name of ["SHELL_BOUNCER_ASK_GATE", "REINS_ASK_GATE", "WHIPPLETREE_ASK_GATE"]) {
       const saved = process.env[name];
       process.env[name] = "off";
       try {
@@ -98,7 +98,7 @@ describe("ask gate: judge()", () => {
 describe("ask gate: the hook, `reins ask-gate`", () => {
   const on = { askTags: { tags: TAGS } };
 
-  it("blocks with exit 2 and a reason when reins.json sets askTags, and bad input passes", () => {
+  it("blocks with exit 2 and a reason when shell-bouncer.json sets askTags, and bad input passes", () => {
     const root = project(on);
     const blocked = hook(root, JSON.stringify(ask("Push?")));
     assert.equal(blocked.status, 2);
@@ -109,7 +109,7 @@ describe("ask gate: the hook, `reins ask-gate`", () => {
     assert.equal(hook(root, JSON.stringify(ask("Push?")), { WHIPPLETREE_ASK_GATE: "log" }).status, 0);
   });
 
-  it("is off by default: no reins.json, or one without askTags", () => {
+  it("is off by default: no shell-bouncer.json, or one without askTags", () => {
     assert.equal(hook(project(), JSON.stringify(ask("Push?"))).status, 0);
     assert.equal(hook(project({ protectedBranches: ["main"] }), JSON.stringify(ask("Push?"))).status, 0);
   });

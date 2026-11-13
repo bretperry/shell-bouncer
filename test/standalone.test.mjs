@@ -151,18 +151,29 @@ describe("the core alone: a bare repo with no reins.json", () => {
     assert.equal(JSON.parse(cursor.stdout).permission, "deny");
     const unknown = spawnSync(process.execPath, [GUARD, "vscode"], { input, env, encoding: "utf8" });
     assert.equal(unknown.status, 2);
-    assert.match(unknown.stderr, /reins hook claude\|cursor/);
+    assert.match(unknown.stderr, /bouncer hook claude\|cursor/);
   });
 
-  it("REINS=off and the old WHIPPLETREE_GUARD=off both turn the hook off; another value doesn't", () => {
-    for (const [name, value, expected] of [["REINS", "off", ""], ["WHIPPLETREE_GUARD", "off", ""], ["REINS", "on", "deny"]]) {
-      const result = spawnSync(process.execPath, [BIN, "hook", "claude"], { input: JSON.stringify({ tool_input: { command: "git push -f origin main" }, cwd: root }), env: { ...process.env, CLAUDE_PROJECT_DIR: root, REINS: "", WHIPPLETREE_GUARD: "", [name]: value }, encoding: "utf8" });
+  it("the current and legacy off switches disable the hook", () => {
+    for (const [name, value, expected] of [["SHELL_BOUNCER", "off", ""], ["REINS", "off", ""], ["WHIPPLETREE_GUARD", "off", ""], ["REINS", "on", "deny"]]) {
+      const result = spawnSync(process.execPath, [BIN, "hook", "claude"], { input: JSON.stringify({ tool_input: { command: "git push -f origin main" }, cwd: root }), env: { ...process.env, CLAUDE_PROJECT_DIR: root, SHELL_BOUNCER: "", REINS: "", WHIPPLETREE_GUARD: "", [name]: value }, encoding: "utf8" });
       assert.equal(result.stdout === "" ? "" : JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, expected, `${name}=${value}`);
     }
   });
 });
 
-describe("reins.json: the config at the project root", () => {
+describe("project configuration", () => {
+  it("prefers shell-bouncer.json and reports its errors even when the legacy file exists", () => {
+    const legacy = { deny: [{ match: "^git status$", reason: "Legacy rule." }] };
+    const current = { ask: [{ match: "^git status$", reason: "Current rule." }] };
+    assert.equal(decisionIn(repoOn("feat", { "reins.json": legacy }), "git status"), "deny");
+    const root = repoOn("feat", { "shell-bouncer.json": current, "reins.json": legacy });
+    assert.equal(decisionIn(root, "git status"), "ask");
+    assert.match(loadRules(folder({ "shell-bouncer.json": "{", "reins.json": legacy })).error, /^shell-bouncer\.json didn't load/);
+    assert.equal(decisionIn(root, "rm shell-bouncer.json"), "ask");
+    assert.equal(decisionIn(root, "rm reins.json"), "ask");
+  });
+
   it("turns bundled sets on by name", () => {
     const root = repoOn("feat", { "reins.json": { sets: ["draft-flow", "ci-minutes"] } });
     assert.deepEqual(loadRules(root).loaded, ["draft-flow", "ci-minutes"]);
@@ -357,7 +368,7 @@ describe("the loader refuses every command when what it was told to read doesn't
   });
 
   it("the off switch named in the refusal is the caller's first offEnv name", () => {
-    assert.match(loadRules(folder({ "reins.json": "{" })).error, /set REINS=off/);
+    assert.match(loadRules(folder({ "reins.json": "{" })).error, /set SHELL_BOUNCER=off/);
     assert.match(loadRules(folder({ "reins.json": "{" }), { offEnv: ["OTHER_GUARD"] }).error, /set OTHER_GUARD=off/);
   });
 

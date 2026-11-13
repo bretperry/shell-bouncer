@@ -5,7 +5,7 @@
 // Uses: src/cli.mjs, loaded by a dynamic import, so a package that doesn't load is caught here.
 // Run: `reins hook claude|cursor` (hook JSON on stdin), `reins ask-gate`, `reins explain "<command>"`, `reins sets`, `reins help`.
 // When: hook entries before every agent command or question; `explain` and `sets` by hand.
-// Env: REINS or WHIPPLETREE_GUARD (`off`: the hook answers nothing, even when the guard doesn't load).
+// Env: SHELL_BOUNCER, REINS, or WHIPPLETREE_GUARD (`off`: the hook answers nothing, even when the guard doesn't load).
 // Writes: the hook's answer on stdout (and a block reason on stderr); nothing on disk.
 // Exit: hook: 0 answered (allow, ask, or deny as JSON), 2 blocked (the guard didn't load, or died without answering); others: see `reins help`.
 //
@@ -20,12 +20,12 @@ import { writeSync } from "node:fs";
 const [command = "help", ...rest] = process.argv.slice(2);
 const hook = command === "hook";
 const cursor = hook && rest[0] === "cursor";
-const off = ["REINS", "WHIPPLETREE_GUARD"].some((name) => process.env[name] === "off");
+const off = ["SHELL_BOUNCER", "REINS", "WHIPPLETREE_GUARD"].some((name) => process.env[name] === "off");
 
 // Says why the command is blocked: Cursor reads a JSON answer, Claude Code reads stderr with exit 2.
 // Each write may fail (a closed pipe); the exit code still blocks.
 const blocked = (why) => {
-  const message = `bouncer: ${why}, so this command is blocked. Tell the user: fix it (reinstall the package), or set REINS=off in the shell that starts the agent.`;
+  const message = `bouncer: ${why}, so this command is blocked. Tell the user: fix it (reinstall the package), or set SHELL_BOUNCER=off in the shell that starts the agent.`;
   if (cursor) {
     try {
       writeSync(1, JSON.stringify({ permission: "deny", user_message: message, agent_message: message }));

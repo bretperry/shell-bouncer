@@ -1,10 +1,10 @@
 // Stops a question reaching the user unless it says why only they can answer it: the ask gate.
 // In the app: nothing at runtime; Claude Code runs it (through `reins ask-gate`) before a tool that asks the user something.
 // Used by: bin/reins.mjs (`reins ask-gate`), and a caller that imports `askGate` from the package; tested by test/ask-gate.test.mjs.
-// Uses: Node builtins; the hook's JSON on stdin; the project's reins.json → askTags (through loadRules()).
+// Uses: Node builtins; the hook's JSON on stdin; the project's shell-bouncer.json → askTags (through loadRules()).
 // Run: not by hand. Claude Code pipes each matching tool call to `reins ask-gate`.
 // When: before a tool that asks the user something. A question in plain chat text doesn't pass through it.
-// Env: REINS_ASK_GATE or WHIPPLETREE_ASK_GATE (`off` and `log` both record and allow; default enforces; `offEnv` replaces the names); CLAUDE_PROJECT_DIR (the project root, when the caller names none).
+// Env: SHELL_BOUNCER_ASK_GATE, REINS_ASK_GATE, or WHIPPLETREE_ASK_GATE (`off` and `log` both record and allow; default enforces; `offEnv` replaces the names); CLAUDE_PROJECT_DIR (the project root, when the caller names none).
 // Writes: one line per question to askTags.log when set (time and tag), so the count can be watched.
 // Exit: 0 allowed; 2 refused, with the reason on stderr for the agent.
 //
@@ -19,10 +19,10 @@ import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, rea
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { DEFAULT_FILES, loadRules } from "./guard.mjs";
+import { loadRules } from "./guard.mjs";
 
 // The mode switch's names: the first one set wins. The second is the name the gate had before it was a package.
-export const DEFAULT_OFF_ENV = Object.freeze(["REINS_ASK_GATE", "WHIPPLETREE_ASK_GATE"]);
+export const DEFAULT_OFF_ENV = Object.freeze(["SHELL_BOUNCER_ASK_GATE", "REINS_ASK_GATE", "WHIPPLETREE_ASK_GATE"]);
 
 // What an untagged question gets, naming the tags.
 export const refusalFor = (tags) => {
@@ -104,7 +104,7 @@ export const run = ({ root, files = {}, askTags, offEnv = DEFAULT_OFF_ENV, input
   let settings = askTags ?? null;
   if (settings === null) {
     // Only the config is read here: no sets.
-    const rules = loadRules(where, { files: { ...DEFAULT_FILES, ...files }, sets: [] });
+    const rules = loadRules(where, { files, sets: [] });
     settings = rules.error === "" ? rules.askTags : null;
   }
   if (settings === null) return 0;

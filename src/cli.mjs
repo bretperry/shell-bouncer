@@ -20,15 +20,16 @@ const HELP = `Shell Bouncer checks a coding agent's shell commands.
 Commands: bouncer, shell-bouncer, reins.
 
   bouncer hook claude|cursor   the hook entry: hook JSON on stdin; exit 0 answered, 2 blocked
-  bouncer ask-gate             the ask gate's hook entry (off unless reins.json sets askTags)
+  bouncer ask-gate             the ask gate's hook entry (off unless shell-bouncer.json sets askTags)
   bouncer explain [--root <dir>] "<command>"
                              prints the verdict and the rule that gave it; runs nothing
   bouncer sets                 lists the bundled rule sets and what each adds
   bouncer --version            prints the package version
   bouncer help                 this text
 
-The config is reins.json at the project root (CLAUDE_PROJECT_DIR, CURSOR_PROJECT_DIR, or the current folder).
-REINS=off turns the guard off for a session.`;
+The config is shell-bouncer.json at the project root (CLAUDE_PROJECT_DIR, CURSOR_PROJECT_DIR, or the current folder).
+If shell-bouncer.json is absent, the guard reads reins.json.
+SHELL_BOUNCER=off turns the guard off for a session.`;
 
 // The project root for a person's command: `--root <dir>` among the arguments, else the hook's.
 const rootArg = (args) => {
@@ -83,7 +84,7 @@ const listSets = () => {
     });
     out.push(`${name}: ${held.join(", ")}`, `  ${String(data["$comment"] ?? "")}`, "");
   }
-  out.push('Turn one on in reins.json: { "sets": ["draft-flow"] }');
+  out.push('Turn one on in shell-bouncer.json: { "sets": ["draft-flow"] }');
   process.stdout.write(`${out.join("\n")}\n`);
   return 0;
 };
