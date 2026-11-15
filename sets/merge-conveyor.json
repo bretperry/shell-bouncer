@@ -1,0 +1,64 @@
+{
+  "$comment": "The merge conveyor. A tick can merge, so only its timer runs one: `tick` (`--dry-run` alone passes) and the timer script are refused, read per program so a commit message or a grep that mentions them passes; the parser reads `pnpm run x` and `sh file` as no program, so those two rows read the command as typed. A subcommand the guard can't read may be `tick`: it asks. A raw post of the `conveyor/cleared` status opens a merge: refused, by curl (both words on one line; reading or grepping it is fine) or `gh api` (statusContexts). Starting it (CONVEYOR_ENABLED to anything but `off`) or deleting the variable asks, by gh, `gh api`, or curl.",
+  "deny": [
+    {
+      "on": "program",
+      "match": "^(?:(?:pnpm|npm|yarn|bun|node)\\s(?:.*\\s)?)?\\S*conveyor(?:\\.mjs)?(?:\\s+--)?\\s+tick\\b",
+      "unless": "\\bconveyor(?:\\.mjs)?(?:\\s+--)?\\s+tick\\s+--dry-run$",
+      "reason": "A tick can merge, so only the conveyor's timer runs it. `pnpm conveyor tick --dry-run` and `pnpm conveyor status` show what it would see."
+    },
+    {
+      "on": "program",
+      "match": "^(?:(?:ba|da|z)?sh\\s(?:.*\\s)?)?\\S*conveyor-timer\\.sh\\b",
+      "reason": "A tick can merge, so only the conveyor's timer runs it. `pnpm conveyor tick --dry-run` and `pnpm conveyor status` show what it would see."
+    },
+    {
+      "on": "segment",
+      "match": "(?:^|[;&|(]\\s*)(?:pnpm|npm|yarn|bun)\\s(?:\\S+\\s+)*?run\\s+(?:(?:-C|-F|-w|--dir|--filter|--prefix|--workspace|--loglevel|--reporter)\\s+[^\\s;&|()]+\\s+|--?[A-Za-z][^\\s;&|()]*\\s+)*conveyor(?:\\s+--)?\\s+tick\\b(?!\\s+--dry-run\\s*(?:$|[;&|)]))",
+      "reason": "A tick can merge, so only the conveyor's timer runs it. `pnpm conveyor tick --dry-run` and `pnpm conveyor status` show what it would see."
+    },
+    {
+      "on": "segment",
+      "match": "(?:^|[;&|(]\\s*)(?:ba|da|z)?sh\\s+\\S*conveyor-timer\\.sh\\b",
+      "reason": "A tick can merge, so only the conveyor's timer runs it. `pnpm conveyor tick --dry-run` and `pnpm conveyor status` show what it would see."
+    },
+    {
+      "on": "segment",
+      "match": "statuses\\/.*conveyor\\/cleared|conveyor\\/cleared.*statuses\\/",
+      "reason": "This status lets the conveyor merge a head. Post it only with `pnpm conveyor clear <pr> <head>`, once every review has passed."
+    }
+  ],
+  "ask": [
+    {
+      "on": "program",
+      "match": "^(?:(?:pnpm|npm|yarn|bun|node)\\s(?:.*\\s)?)?\\S*conveyor(?:\\.mjs)?(?:\\s+--)?\\s+\\S*[$`*?[{]",
+      "reason": "The guard can't read which conveyor subcommand this runs, and `tick` can merge. Name it: `pnpm conveyor clear|status|report`."
+    },
+    {
+      "on": "segment",
+      "match": "(?:^|[;&|(]\\s*)curl\\s.*CONVEYOR_ENABLED",
+      "flags": "i",
+      "reason": "CONVEYOR_ENABLED decides whether the timer merges, so starting it or removing the variable is the user's call. `--body off` stops it and needs no asking."
+    }
+  ],
+  "statusContexts": [
+    {
+      "match": "^conveyor\\/cleared$",
+      "flags": "i",
+      "verdict": "deny",
+      "reason": "This status lets the conveyor merge a head. Post it only with `pnpm conveyor clear <pr> <head>`, once every review has passed."
+    }
+  ],
+  "repoVariables": [
+    {
+      "name": "CONVEYOR_ENABLED",
+      "free": [
+        "off"
+      ],
+      "verdict": "ask",
+      "reason": "CONVEYOR_ENABLED decides whether the timer merges, so starting it or removing the variable is the user's call. `--body off` stops it and needs no asking.",
+      "unreadableBody": "CONVEYOR_ENABLED decides whether the timer merges, so starting it or removing the variable is the user's call. `--body off` stops it and needs no asking.",
+      "unreadableName": "CONVEYOR_ENABLED decides whether the timer merges, so starting it or removing the variable is the user's call. `--body off` stops it and needs no asking."
+    }
+  ]
+}

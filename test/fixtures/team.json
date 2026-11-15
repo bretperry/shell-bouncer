@@ -1,0 +1,112 @@
+{
+  "$comment": "A test fixture, not a bundled set: one team's rules, exercising every knob a rule set has (rows read per program and as typed, protected and workflow-only branches, status contexts, repository variables, marker files, a freeze marker, a skip-CI rule, a push variable, a git setting, and guard files).",
+  "protectedBranches": [
+    "main",
+    "dev",
+    "base"
+  ],
+  "workflowOnlyBranches": [
+    "base"
+  ],
+  "deny": [
+    {
+      "on": "segment",
+      "match": "(?:^|[\\s;&|'\"(/=])autopilot(?:\\.mjs)?(?:\\s+--)?\\s+['\"]?on['\"]?(?=$|[\\s;&|'\")])",
+      "reason": "Only the user switches autopilot mode on. Ask them."
+    },
+    {
+      "on": "segment",
+      "match": "team-autopilot",
+      "reason": "Only the user switches autopilot mode on. Ask them."
+    },
+    {
+      "on": "segment",
+      "match": "(?:^|[\\s;&|'\"(/=])approve(?:\\.mjs)?(?:\\s+--)?\\s+['\"]?\\d",
+      "reason": "Only the user records an approval. Ask them; `pnpm approve list` and `check` are yours to read."
+    },
+    {
+      "on": "segment",
+      "match": "team-approvals",
+      "reason": "Only the user records an approval. Ask them; `pnpm approve list` and `check` are yours to read."
+    },
+    {
+      "on": "segment",
+      "match": "(?:^|[;&|(]\\s*)curl\\s.*RUNNER_POLICY",
+      "flags": "i",
+      "reason": "RUNNER_POLICY decides whether CI may bill hosted runners, so only the repo's owner changes it. Tell them what you need and why."
+    },
+    {
+      "on": "segment",
+      "match": "statuses\\/.*context(?:=[\"']?|\"\\s*:\\s*\")review\\/|context(?:=[\"']?|\"\\s*:\\s*\")review\\/.*statuses\\/",
+      "reason": "A review gate goes through `pnpm gate post <pr> <name> <verdict>`, which fingerprints the PR's files and refuses the writer's own branch."
+    }
+  ],
+  "ask": [
+    {
+      "on": "program",
+      "match": "^(?:[Nn][Oo][Dd][Ee]\\s(?:.*\\s)?)?\\S*[Bb][Aa][Tt][Cc][Hh]-[Mm][Ee][Rr][Gg][Ee]\\.[Mm][Jj][Ss]\\b",
+      "unless": "\\s--dry-run\\b",
+      "reason": "batch-merge.mjs merges for real (and --ship merges main, which deploys): it needs the user's OK for this batch."
+    },
+    {
+      "on": "program",
+      "match": "^(?:[Pp][Yy][Tt][Hh][Oo][Nn]3?\\s(?:.*\\s)?)?\\S*[Bb][Aa][Tt][Cc][Hh]_[Mm][Ee][Rr][Gg][Ee]\\.[Pp][Yy]\\b",
+      "unless": "\\s--dry-run\\b",
+      "reason": "batch_merge.py merges for real (and --ship merges main, which deploys): it needs the user's OK for this batch."
+    }
+  ],
+  "statusContexts": [
+    {
+      "match": "^review\\/",
+      "flags": "i",
+      "verdict": "deny",
+      "reason": "A review gate goes through `pnpm gate post <pr> <name> <verdict>`, which fingerprints the PR's files and refuses the writer's own branch.",
+      "unreadable": "This posts a commit status whose context the guard can't read (a variable, a glob, or a body from a file or stdin), and it could be `conveyor/cleared` or a `review/<name>`. Those go through `pnpm conveyor clear` and `pnpm gate post`; the user confirms anything else."
+    }
+  ],
+  "repoVariables": [
+    {
+      "name": "RUNNER_POLICY",
+      "verdict": "deny",
+      "reason": "RUNNER_POLICY decides whether CI may bill hosted runners, so only the repo's owner changes it. Tell them what you need and why.",
+      "unreadableName": "This variable name is filled in by the shell or a glob, and the guard can't tell it from RUNNER_POLICY or CONVEYOR_ENABLED, which only the owner changes. The user confirms."
+    }
+  ],
+  "markerFiles": [
+    {
+      "name": "team-autopilot",
+      "reason": "This write's target is a pattern or an expansion that could name autopilot mode's marker file, and the guard can't tell what the shell makes of it. Only the user switches autopilot on: use a plain path, or ask them."
+    }
+  ],
+  "freezeMarkers": [
+    {
+      "file": "team-freeze",
+      "branch": "dev",
+      "reason": "dev is frozen while the release PR{pr} is open: a push to dev moves its head and cancels its checks. Hold the commit and push it after the merge."
+    }
+  ],
+  "skipCi": {
+    "match": "\\[(skip ci|ci skip|no ci|skip actions|actions skip)\\]|skip-checks:\\s*true",
+    "flags": "i",
+    "allowOn": [
+      "dev"
+    ],
+    "reason": "[skip ci] is only for docs-only commits on dev; on '{branch}' it leaves required checks pending forever. To land docs on dev from here: a docs-only commit on dev.",
+    "unreadable": "[skip ci] is only for docs-only commits on dev, and the guard couldn't tell which branch this commit is on."
+  },
+  "pushEnvDeny": [
+    "TEAM_SKIP_CHECKS"
+  ],
+  "gitConfigAsk": [
+    {
+      "key": "team.prepush",
+      "reason": "Setting team.prepush decides whether this machine's pre-push hook runs the full check before a push; the user confirms."
+    }
+  ],
+  "guardFiles": [
+    "scripts/team-guard.mjs",
+    "scripts/team-guard-hook.mjs",
+    "scripts/team-guard.pin.json",
+    ".team-rules/"
+  ]
+}

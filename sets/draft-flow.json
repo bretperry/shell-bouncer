@@ -1,0 +1,17 @@
+{
+  "$comment": "A draft-first PR flow. `--undo` flips a ready PR back to draft, which skips the heavy CI someone chose to run: refused. Ready starts the heavy CI, and a PR is marked ready only once the user has read it: it asks. The GraphQL road to the draft flip is the guard's code (evaluateGhApi).",
+  "deny": [
+    {
+      "on": "program",
+      "match": "^gh\\s+pr\\s+ready\\b.*--undo\\b",
+      "reason": "Never flip a ready PR back to draft. Tell the user why you think it isn't ready."
+    }
+  ],
+  "ask": [
+    {
+      "on": "program",
+      "match": "^gh\\s+pr\\s+ready\\b",
+      "reason": "Only the person merging marks a PR ready, and only after the user has read this PR and asked for it."
+    }
+  ]
+}
